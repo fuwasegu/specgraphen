@@ -18,6 +18,61 @@ fn build_engine() -> QueryEngine {
     QueryEngine::new(result.space_data)
 }
 
+fn build_engine_with_sources() -> QueryEngine {
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/simple-project");
+
+    let mut lifter = JavaLifter::new().expect("Failed to create lifter");
+    let config = LiftConfig {
+        root_path: fixture_path.clone(),
+        space_id: "test".to_string(),
+        space_label: "Test".to_string(),
+        ..Default::default()
+    };
+    let result = lifter.lift(&config).expect("Lift failed");
+
+    let mut source_files = std::collections::HashMap::new();
+    for entity in &result.space_data.entities {
+        let file = &entity.witness.file;
+        if file.is_empty() || source_files.contains_key(file) {
+            continue;
+        }
+        let content = std::fs::read_to_string(file)
+            .or_else(|_| std::fs::read_to_string(fixture_path.join(file)))
+            .expect("Failed to read source file referenced by witness");
+        source_files.insert(file.clone(), content);
+    }
+
+    QueryEngine::new(result.space_data).with_sources(source_files)
+}
+
+#[test]
+fn test_column_usage_plain_java_class() {
+    let engine = build_engine_with_sources();
+    let result = engine.column_usage("User").expect("column_usage failed");
+
+    assert_eq!(result.table_class, "com.example.model.User");
+
+    let email = result
+        .columns
+        .iter()
+        .find(|c| c.field_name == "email")
+        .expect("email column should be present");
+    assert_eq!(email.data_type, "String");
+    assert_eq!(email.column_name, "email");
+    assert!(
+        !email.readers.is_empty(),
+        "getEmail() callers should be detected as readers"
+    );
+
+    let id = result
+        .columns
+        .iter()
+        .find(|c| c.field_name == "id")
+        .expect("id column should be present");
+    assert_eq!(id.data_type, "Long");
+}
+
 #[test]
 fn test_explain_method() {
     let engine = build_engine();

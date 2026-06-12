@@ -4,6 +4,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use specgraphen_model::SpaceData;
 
+use crate::java;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ColumnUsageResult {
     pub table_class: String,
@@ -51,13 +53,13 @@ pub fn column_usage(
 
     let class_fqn = &class_entity.fqn;
 
-    // Parse source to extract makeAttribute patterns
+    // Parse field declarations (types, JPA @Column names, doc comments)
     let source = source_files
         .get(&class_entity.witness.file)
         .cloned()
         .unwrap_or_default();
 
-    let column_defs = parse_make_attribute_calls(&source);
+    let column_defs = java::parse_field_declarations(&source);
 
     // Find all field entities for this class
     let fields: Vec<_> = space_data
@@ -77,12 +79,12 @@ pub fn column_usage(
 
         let col_def = column_defs.iter().find(|d| d.field_name == field_name);
 
-        let logical_name = col_def.map(|d| d.logical_name.clone()).unwrap_or_default();
+        let logical_name = col_def.and_then(|d| d.doc.clone()).unwrap_or_default();
         let column_name = col_def
-            .map(|d| d.column_name.clone())
+            .and_then(|d| d.column_name.clone())
             .unwrap_or_else(|| field_name.to_string());
         let data_type = col_def
-            .map(|d| d.data_type.clone())
+            .map(|d| d.declared_type.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
         let (readers, writers) = find_field_usages(field_name, class_fqn, source_files);
@@ -118,82 +120,6 @@ pub fn column_usage(
     })
 }
 
-#[derive(Debug)]
-struct ColumnDef {
-    field_name: String,
-    logical_name: String,
-    column_name: String,
-    data_type: String,
-}
-
-fn parse_make_attribute_calls(source: &str) -> Vec<ColumnDef> {
-    let mut defs = Vec::new();
-
-    for line in source.lines() {
-        let trimmed = line.trim();
-
-        // Pattern: public DataAttributeXxx FIELD_NAME = makeAttribute("論理名", "カラム名", new DataDomainXxx(...));
-        if let Some(pos) = trimmed.find("makeAttribute(") {
-            // Extract field name
-            let field_name = trimmed
-                .split_whitespace()
-                .take_while(|w| !w.contains("makeAttribute"))
-                .filter(|w| {
-                    !w.starts_with("public")
-                        && !w.starts_with("private")
-                        && !w.starts_with("protected")
-                        && !w.starts_with("DataAttribute")
-                        && *w != "="
-                        && !w.is_empty()
-                })
-                .last()
-                .unwrap_or("")
-                .to_string();
-
-            // Extract arguments from makeAttribute("logical", "column", ...)
-            let args_start = pos + "makeAttribute(".len();
-            let args_str = &trimmed[args_start..];
-
-            let parts: Vec<&str> = args_str.split('"').collect();
-            let logical_name = parts.get(1).unwrap_or(&"").to_string();
-            let column_name = parts.get(3).unwrap_or(&"").to_string();
-
-            // Extract data type from DataDomainXxx or DataAttributeXxx
-            let data_type = if trimmed.contains("DataDomainString")
-                || trimmed.contains("DataAttributeString")
-            {
-                "String"
-            } else if trimmed.contains("DataDomainNumeric")
-                || trimmed.contains("DataAttributeNumeric")
-            {
-                "Numeric"
-            } else if trimmed.contains("DataDomainDateTime")
-                || trimmed.contains("DataAttributeDateTime")
-            {
-                "DateTime"
-            } else if trimmed.contains("DataDomainBlob") || trimmed.contains("DataAttributeBlob") {
-                "Blob"
-            } else if trimmed.contains("NumericFlag") {
-                "Flag"
-            } else {
-                "unknown"
-            }
-            .to_string();
-
-            if !field_name.is_empty() {
-                defs.push(ColumnDef {
-                    field_name,
-                    logical_name,
-                    column_name,
-                    data_type,
-                });
-            }
-        }
-    }
-
-    defs
-}
-
 fn find_field_usages(
     field_name: &str,
     class_fqn: &str,
@@ -201,6 +127,9 @@ fn find_field_usages(
 ) -> (Vec<UsageSite>, Vec<UsageSite>) {
     let mut readers = Vec::new();
     let mut writers = Vec::new();
+
+    let getters = java::getter_patterns(field_name);
+    let setter = java::setter_pattern(field_name);
 
     let class_simple = class_fqn.rsplit('.').next().unwrap_or(class_fqn);
     let class_file_hint = format!("{class_simple}.java");
@@ -214,27 +143,16 @@ fn find_field_usages(
         for (line_num, line) in content.lines().enumerate() {
             let line_num = line_num as u32 + 1;
 
-            // Look for field access: .FIELD_NAME with word boundary
-            if !line.contains(field_name) {
+            let has_direct = java::has_direct_field_access(line, field_name);
+            let has_getter = getters.iter().any(|g| line.contains(g.as_str()));
+            let has_setter = line.contains(setter.as_str());
+
+            if !has_direct && !has_getter && !has_setter {
                 continue;
             }
 
-            let access_pattern = format!(".{field_name}");
-            if !line.contains(&access_pattern) {
-                continue;
-            }
-
-            // Determine read vs write
-            let trimmed = line.trim();
-            let is_write = trimmed.contains(&format!(".{field_name}.setValue"))
-                || trimmed.contains(&format!(".{field_name}.set("))
-                || trimmed.contains(&format!(".{field_name} ="))
-                || trimmed.contains(&format!(".{field_name}="));
-
-            let is_read = trimmed.contains(&format!(".{field_name}.getValue"))
-                || trimmed.contains(&format!(".{field_name}.get("))
-                || trimmed.contains(&format!(".{field_name}.toString"))
-                || (trimmed.contains(&access_pattern) && !is_write);
+            let is_write = has_setter || java::is_direct_field_write(line, field_name);
+            let is_read = has_getter || (has_direct && !is_write);
 
             let inferred_class = infer_class_from_file(file_path);
 

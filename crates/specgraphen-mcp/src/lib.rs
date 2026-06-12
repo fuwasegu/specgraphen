@@ -200,7 +200,7 @@ impl SpecGraphenServer {
                 },
                 {
                     "name": "column_usage",
-                    "description": "Analyze how each column (field) of a data/table class is used across the codebase. Returns: column name, Japanese logical name, data type, and all read/write sites with file:line. Use this to understand what each DB column is for and where it's accessed.",
+                    "description": "Analyze how each column (field) of a data/table class is used across the codebase. Returns: column name, logical name (from JPA @Column annotations and doc comments), data type, and all read/write sites with file:line. Use this to understand what each DB column is for and where it's accessed.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

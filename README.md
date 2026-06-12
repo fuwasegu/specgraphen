@@ -128,8 +128,7 @@ specgraphen lift --root ./project --space-id myproject --lsp java
 | Without LSP | With LSP (jdtls) |
 |---|---|
 | Name-based heuristic resolution | Type-strict definition lookup |
-| ~11,000 unresolved references | ~2,700 unresolved (76% reduction) |
-| ~6,500 relations | ~15,200 relations (134% increase) |
+| Cross-file and overloaded calls often stay unresolved | Far fewer unresolved references, much denser call graph |
 
 The `TypeResolver` trait supports multiple languages:
 - **Java**: jdtls (Eclipse JDT Language Server)
@@ -238,8 +237,7 @@ LSP を使うと型厳密なシンボル解決が可能に:
 | LSP なし | LSP あり (jdtls) |
 |---|---|
 | 名前ベースのヒューリスティック解決 | 型厳密な定義ルックアップ |
-| 未解決参照 ~11,000 件 | 未解決 ~2,700 件（76% 削減） |
-| 関係 ~6,500 | 関係 ~15,200（134% 増加） |
+| クロスファイル・オーバーロード呼び出しが未解決になりやすい | 未解決参照が大幅に減り、呼び出しグラフが密になる |
 
 `TypeResolver` trait で言語を抽象化:
 - **Java**: jdtls（実装済み）

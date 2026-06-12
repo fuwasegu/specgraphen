@@ -7,6 +7,7 @@ pub mod enrich;
 mod explain;
 mod feature;
 mod impact;
+mod java;
 mod overview;
 pub mod projection;
 pub mod resolve;
