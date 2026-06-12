@@ -8,11 +8,19 @@
 //! (`if (a) return; if (a) ...`) are never enumerated — this prevents
 //! infeasible paths from being treated as don't-cares downstream.
 //!
+//! Outcomes are observable behavior, not just return text: variable writes
+//! are tracked symbolically along each path, `return x` reports the value
+//! last assigned to `x`, and writes to non-local targets (fields) are
+//! appended to the outcome label. Paths that differ only in a field
+//! mutation therefore form distinct outcome classes — without this,
+//! assignment-driven methods would report their conditions as falsely dead.
+//!
 //! Honesty over coverage: constructs this walker does not model (loops,
 //! `switch`, `try`, …) mark the method [`MethodDecision::incomplete`] when
-//! they can terminate the method (contain `return`/`throw`), and methods
+//! they can terminate the method (contain `return`/`throw`), methods
 //! exceeding the atom/path caps are skipped with a reason instead of
-//! producing a partial table.
+//! producing a partial table, and side effects of method calls
+//! (`list.add(...)` …) remain unmodeled.
 
 use specgraphen_logic::{DecisionTable, Tri};
 
@@ -167,12 +175,13 @@ fn extract_method(
     let mut walker = Walker {
         src,
         atoms: Vec::new(),
+        locals: parameter_names(node, src),
         paths: Vec::new(),
         incomplete: false,
     };
 
     let stmts = named_children(body);
-    match walker.walk(&stmts, 0, Vec::new()) {
+    match walker.walk(&stmts, 0, State::default()) {
         Ok(fallthroughs) => {
             for state in fallthroughs {
                 walker.paths.push((state, "(fall-through)".to_string()));
@@ -184,7 +193,7 @@ fn extract_method(
         }
     }
 
-    if walker.atoms.is_empty() {
+    if walker.atoms.is_empty() || walker.paths.is_empty() {
         return; // no branching — nothing to compress
     }
     if walker.paths.len() > MAX_PATHS {
@@ -194,14 +203,50 @@ fn extract_method(
         return;
     }
 
+    // Observable effects per path (field writes + statement calls). Effects
+    // shared by every path carry no discriminative information — subtract
+    // them so outcome labels show only what the conditions actually change.
+    let path_effects: Vec<Vec<String>> = walker
+        .paths
+        .iter()
+        .map(|(state, _)| {
+            state
+                .writes
+                .iter()
+                .filter(|(target, _)| !walker.locals.contains(target.as_str()))
+                .map(|(target, value)| format!("{target} = {value}"))
+                .chain(state.calls.iter().cloned())
+                .collect()
+        })
+        .collect();
+    let common: std::collections::HashSet<&String> =
+        path_effects
+            .iter()
+            .skip(1)
+            .fold(path_effects[0].iter().collect(), |acc, effects| {
+                let set: std::collections::HashSet<&String> = effects.iter().collect();
+                acc.intersection(&set).copied().collect()
+            });
+
     let mut table = DecisionTable::new(walker.atoms.clone());
-    for (state, outcome) in &walker.paths {
+    for ((state, core), effects) in walker.paths.iter().zip(&path_effects) {
+        let distinct: Vec<&str> = effects
+            .iter()
+            .filter(|e| !common.contains(e))
+            .map(String::as_str)
+            .collect();
+        let outcome = if distinct.is_empty() {
+            core.clone()
+        } else {
+            format!("{core} {{{}}}", distinct.join(", "))
+        };
+
         let mut inputs = vec![Tri::Any; walker.atoms.len()];
-        for &(atom, value) in state {
+        for &(atom, value) in &state.conds {
             inputs[atom] = if value { Tri::True } else { Tri::False };
         }
         table
-            .add_row(inputs, outcome.clone())
+            .add_row(inputs, outcome)
             .expect("row arity matches atom count");
     }
 
@@ -214,12 +259,23 @@ fn extract_method(
     });
 }
 
-/// Path state: atom assignments accumulated along one execution path.
-type State = Vec<(usize, bool)>;
+/// Per-path symbolic state: condition-atom assignments plus observable effects.
+#[derive(Debug, Clone, Default)]
+struct State {
+    conds: Vec<(usize, bool)>,
+    /// Normalized assignment target → last assigned value text along this path.
+    writes: std::collections::BTreeMap<String, String>,
+    /// Statement-level method calls along this path (`abortOnError()`,
+    /// `sendNotification(...)` …) — in legacy code these ARE the outcome.
+    calls: std::collections::BTreeSet<String>,
+}
 
 struct Walker<'a> {
     src: &'a [u8],
     atoms: Vec<String>,
+    /// Names that cannot escape the method (parameters and declared locals);
+    /// writes to them are invisible in outcomes unless returned.
+    locals: std::collections::HashSet<String>,
     paths: Vec<(State, String)>,
     incomplete: bool,
 }
@@ -242,14 +298,21 @@ impl Walker<'_> {
 
         match stmt.kind() {
             "return_statement" => {
-                let expr = named_children(stmt)
-                    .first()
-                    .map(|n| normalize(&text(*n, self.src)));
-                let outcome = match expr {
-                    Some(e) => format!("return {e}"),
+                let core = match named_children(stmt).first() {
+                    Some(node) => {
+                        let expr = normalize(&text(*node, self.src));
+                        // `return x` after `x = <v>` reports the assigned value,
+                        // so paths that differ only in the write stay distinct.
+                        let value = if node.kind() == "identifier" {
+                            state.writes.get(&expr).cloned().unwrap_or(expr)
+                        } else {
+                            expr
+                        };
+                        format!("return {value}")
+                    }
                     None => "return".to_string(),
                 };
-                self.paths.push((state, outcome));
+                self.paths.push((state, core));
                 Ok(Vec::new())
             }
             "throw_statement" => {
@@ -259,6 +322,30 @@ impl Walker<'_> {
                     .unwrap_or_default();
                 self.paths.push((state, format!("throw {expr}")));
                 Ok(Vec::new())
+            }
+            "local_variable_declaration" => {
+                let mut state = state;
+                for declarator in named_children(stmt) {
+                    if declarator.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let Some(name) = declarator.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let name = normalize(&text(name, self.src));
+                    self.locals.insert(name.clone());
+                    if let Some(value) = declarator.child_by_field_name("value") {
+                        state.writes.insert(name, normalize(&text(value, self.src)));
+                    }
+                }
+                self.walk(stmts, idx + 1, state)
+            }
+            "expression_statement" => {
+                let mut state = state;
+                if let Some(expr) = named_children(stmt).first() {
+                    self.record_write(*expr, &mut state);
+                }
+                self.walk(stmts, idx + 1, state)
             }
             "if_statement" => {
                 let cond = stmt
@@ -309,6 +396,54 @@ impl Walker<'_> {
                 self.walk(stmts, idx + 1, state)
             }
             _ => self.walk(stmts, idx + 1, state),
+        }
+    }
+
+    /// Record an assignment / increment as a symbolic write. Anything else
+    /// (method calls etc.) is ignored — their side effects are not modeled.
+    fn record_write(&mut self, expr: tree_sitter::Node, state: &mut State) {
+        match expr.kind() {
+            "assignment_expression" => {
+                let (Some(left), Some(right)) = (
+                    expr.child_by_field_name("left"),
+                    expr.child_by_field_name("right"),
+                ) else {
+                    return;
+                };
+                let target = normalize(&text(left, self.src));
+                let operator = expr
+                    .child_by_field_name("operator")
+                    .map(|n| text(n, self.src))
+                    .unwrap_or_default();
+                // Compound assignment (`+=` …) has no simple value; keep the
+                // whole expression text — outcomes still distinguish the paths.
+                let value = if operator == "=" {
+                    normalize(&text(right, self.src))
+                } else {
+                    normalize(&text(expr, self.src))
+                };
+                state.writes.insert(target, value);
+            }
+            "update_expression" => {
+                // i++ / --i: opaque value, but an observable write
+                let whole = normalize(&text(expr, self.src));
+                let target = whole.trim_matches(['+', '-', ' ']).to_string();
+                if !target.is_empty() {
+                    state.writes.insert(target, whole);
+                }
+            }
+            "method_invocation" => {
+                // Statement-level calls (error exits, state mutations) are
+                // observable behavior — without them, branches that only call
+                // out are reported as falsely dead. Logging is excluded: it is
+                // not business behavior, and per-branch log messages would
+                // otherwise explode the outcome alphabet and kill compression.
+                let call = normalize(&text(expr, self.src));
+                if !is_logging_call(&call) {
+                    state.calls.insert(call);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -400,16 +535,45 @@ impl Walker<'_> {
             }
         };
 
-        if let Some(&(_, value)) = state.iter().find(|(a, _)| *a == id) {
+        if let Some(&(_, value)) = state.conds.iter().find(|(a, _)| *a == id) {
             return Ok(vec![(state, value)]);
         }
 
         let mut true_state = state.clone();
-        true_state.push((id, true));
+        true_state.conds.push((id, true));
         let mut false_state = state;
-        false_state.push((id, false));
+        false_state.conds.push((id, false));
         Ok(vec![(true_state, true), (false_state, false)])
     }
+}
+
+/// Logging receivers conventional in (legacy) Java. Branches that only log
+/// are treated as having no observable effect — for spec extraction that is
+/// the desired reading, and it keeps outcome classes compressible.
+const LOGGING_PREFIXES: &[&str] = &[
+    "logger.",
+    "log.",
+    "LOG.",
+    "Logger.",
+    "System.out.",
+    "System.err.",
+];
+
+fn is_logging_call(call: &str) -> bool {
+    LOGGING_PREFIXES.iter().any(|p| call.starts_with(p))
+}
+
+fn parameter_names(method: tree_sitter::Node, src: &[u8]) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if let Some(params) = method.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            if let Some(name) = param.child_by_field_name("name") {
+                names.insert(text(name, src));
+            }
+        }
+    }
+    names
 }
 
 fn named_children(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
@@ -663,6 +827,183 @@ mod tests {
         assert_eq!(e.skipped.len(), 1);
         assert!(e.skipped[0].0.ends_with("A.m"));
         assert!(e.skipped[0].1.contains("distinct conditions"));
+    }
+
+    #[test]
+    fn assignment_to_returned_variable_distinguishes_outcomes() {
+        // The BF-batch validation pattern: branches only assign, single return
+        let m = single(
+            r#"
+            class A {
+                int m(boolean c1, boolean c2) {
+                    int a = 0;
+                    if (c1) { a = -1; }
+                    if (c2) { a = -1; }
+                    return a;
+                }
+            }
+            "#,
+        );
+        let outcomes: std::collections::HashSet<_> =
+            m.table.rows().iter().map(|r| r.outcome.clone()).collect();
+        assert!(outcomes.contains("return -1"), "{outcomes:?}");
+        assert!(outcomes.contains("return 0"), "{outcomes:?}");
+        let c = compress(&m.table).unwrap();
+        assert!(
+            c.dead_variables.is_empty(),
+            "conditions wrongly dead: {:?}",
+            c.dead_variables
+        );
+    }
+
+    #[test]
+    fn declaration_initializer_feeds_substitution() {
+        let m = single(
+            r#"
+            class A {
+                String m(boolean c) {
+                    String r = "A";
+                    if (c) { r = "B"; }
+                    return r;
+                }
+            }
+            "#,
+        );
+        let outcomes: Vec<_> = m.table.rows().iter().map(|r| r.outcome.as_str()).collect();
+        assert!(outcomes.contains(&"return \"B\""), "{outcomes:?}");
+        assert!(outcomes.contains(&"return \"A\""), "{outcomes:?}");
+    }
+
+    #[test]
+    fn field_write_is_an_observable_outcome() {
+        // Setter pattern: previously reported the condition as falsely dead
+        let m = single(
+            r#"
+            class A {
+                void setKbn(String x) {
+                    if (x.equals("1")) { this.flag = true; }
+                }
+            }
+            "#,
+        );
+        let c = compress(&m.table).unwrap();
+        assert!(
+            c.dead_variables.is_empty(),
+            "field-writing condition wrongly dead: {:?}",
+            c.dead_variables
+        );
+        assert!(
+            m.table
+                .rows()
+                .iter()
+                .any(|r| r.outcome.contains("this.flag = true")),
+            "{:?}",
+            m.table.rows()
+        );
+    }
+
+    #[test]
+    fn local_only_write_stays_invisible() {
+        // A branch that only touches a local has no observable effect:
+        // the condition is genuinely dead and must stay so.
+        let m = single(
+            r#"
+            class A {
+                void m(boolean c) {
+                    int tmp = 0;
+                    if (c) { tmp = 1; }
+                }
+            }
+            "#,
+        );
+        let c = compress(&m.table).unwrap();
+        assert_eq!(c.dead_variables, vec!["c"]);
+    }
+
+    #[test]
+    fn parameter_write_stays_invisible() {
+        let m = single(
+            r#"
+            class A {
+                void m(boolean c, int a) {
+                    if (c) { a = 1; }
+                }
+            }
+            "#,
+        );
+        let c = compress(&m.table).unwrap();
+        assert_eq!(c.dead_variables, vec!["c"]);
+    }
+
+    #[test]
+    fn call_only_branch_is_observable() {
+        // The legacy error-exit pattern: the branch only logs and calls an
+        // exit helper. Previously reported the condition as falsely dead.
+        let m = single(
+            r#"
+            class A {
+                void check(String dir) {
+                    if (dir.equals("")) {
+                        logger.error("missing");
+                        abortOnError();
+                    }
+                }
+            }
+            "#,
+        );
+        let c = compress(&m.table).unwrap();
+        assert!(c.dead_variables.is_empty(), "{:?}", c.dead_variables);
+        assert!(
+            m.table
+                .rows()
+                .iter()
+                .any(|r| r.outcome.contains("abortOnError()")),
+            "{:?}",
+            m.table.rows()
+        );
+    }
+
+    #[test]
+    fn logging_only_branch_reads_as_no_effect() {
+        // A branch that only logs is not business behavior: for spec
+        // extraction the condition is correctly reported dead.
+        let m = single(
+            r#"
+            class A {
+                void m(boolean c) {
+                    if (c) { logger.warn("odd"); }
+                }
+            }
+            "#,
+        );
+        let c = compress(&m.table).unwrap();
+        assert_eq!(c.dead_variables, vec!["c"]);
+    }
+
+    #[test]
+    fn effects_common_to_all_paths_are_not_shown() {
+        // Both paths write this.audit and call init(); only the branch-
+        // dependent write should appear in outcome labels.
+        let m = single(
+            r#"
+            class A {
+                void m(boolean c) {
+                    init();
+                    this.audit = "yes";
+                    if (c) { this.flag = true; }
+                }
+            }
+            "#,
+        );
+        for row in m.table.rows() {
+            assert!(!row.outcome.contains("audit"), "{}", row.outcome);
+            assert!(!row.outcome.contains("init()"), "{}", row.outcome);
+        }
+        assert!(m
+            .table
+            .rows()
+            .iter()
+            .any(|r| r.outcome.contains("this.flag = true")));
     }
 
     #[test]
