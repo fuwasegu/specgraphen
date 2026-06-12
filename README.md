@@ -138,6 +138,7 @@ Just ask naturally:
 | `dead_code` | Unused methods/classes with confidence levels (deletion candidates) |
 | `hotspots` | Methods ranked by approximate cyclomatic complexity (refactoring triage) |
 | `crud_matrix` | Entry-point × table CRUD matrix from SQL, mapper XML, and repository conventions |
+| `extract_core_rules` | Minimal decision table for a method's branching logic (Quine-McCluskey); flags dead conditions |
 | `export_spec` | Markdown specification built from structure + accumulated annotations |
 
 ### Enrich flow (Claude Code as LLM)
@@ -306,6 +307,7 @@ LSP が使えない環境では tree-sitter ヒューリスティックに自動
 | レガシー | `dead_code` | 未使用メソッド/クラスの検出（確信度付き削除候補） |
 | レガシー | `hotspots` | 複雑度によるメソッドランキング（リファクタ優先度） |
 | レガシー | `crud_matrix` | エントリポイント × テーブルの CRUD マトリクス |
+| レガシー | `extract_core_rules` | 分岐ロジックを最小ディシジョンテーブルに圧縮（不要条件を数学的に特定） |
 | レガシー | `export_spec` | 構造 + 注釈から Markdown 仕様書を生成 |
 | 学習 | `enrich` | ソースコード + コンテキストを返す |
 | 学習 | `enrich_batch` | 未分析エンティティの一括取得 |

@@ -1391,6 +1391,8 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "specgraphen-lift",
+ "specgraphen-logic",
  "specgraphen-model",
  "specgraphen-query",
  "specgraphen-store",

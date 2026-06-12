@@ -56,6 +56,13 @@ impl SpecGraphenServer {
         Ok(())
     }
 
+    /// Handle one raw JSON-RPC request and return the serialized response.
+    /// Useful for embedding and integration tests; `run_stdio` is a loop
+    /// over this.
+    pub fn handle_request_line(&self, input: &str) -> String {
+        serde_json::to_string(&self.handle_request(input)).expect("response serializes")
+    }
+
     fn handle_request(&self, input: &str) -> JsonRpcResponse {
         let request: JsonRpcRequest = match serde_json::from_str(input) {
             Ok(r) => r,
@@ -380,6 +387,20 @@ impl SpecGraphenServer {
                         "properties": {},
                         "required": []
                     }
+                },
+                {
+                    "name": "extract_core_rules",
+                    "description": "Flatten a method's branching logic into a mathematically minimized decision table (Quine-McCluskey). Enumerates all execution paths through if/else (decomposing && and || with short-circuit semantics), then removes conditions that provably never influence any outcome — these 'dead variables' are typically leftover patch noise, and the surviving rules are the true specification. Pass a method FQN for one method or a class FQN for every branching method in the class. Requires the server to be started with --source-root.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {
+                                "type": "string",
+                                "description": "Method or class FQN (partial suffix match supported, e.g. 'UserService.createUser' or 'UserService')"
+                            }
+                        },
+                        "required": ["symbol"]
+                    }
                 }
             ]
         }))
@@ -623,12 +644,93 @@ impl SpecGraphenServer {
                     return Err((-32000, "Store path not configured".to_string()));
                 }
             }
+            "extract_core_rules" => {
+                let symbol = arguments["symbol"]
+                    .as_str()
+                    .ok_or((-32602, "Missing symbol argument".to_string()))?;
+                self.extract_core_rules(symbol)?
+            }
             _ => return Err((-32602, format!("Unknown tool: {tool_name}"))),
         };
 
         Ok(serde_json::json!({
             "content": [{"type": "text", "text": result_text}]
         }))
+    }
+
+    fn extract_core_rules(&self, symbol: &str) -> Result<String, (i32, String)> {
+        let (fqn, file, _) = self
+            .query_engine
+            .witness_of(symbol)
+            .ok_or((-32000, format!("Symbol not found: {symbol}")))?;
+
+        let source = self.query_engine.file_source(&file).ok_or((
+            -32000,
+            format!(
+                "Source for {file} is not loaded. Start the server with \
+                 --source-root pointing at the Java source tree."
+            ),
+        ))?;
+
+        let mut extractor = specgraphen_lift::DecisionExtractor::new()
+            .map_err(|e| (-32000, format!("Extractor init failed: {e}")))?;
+        let extraction = extractor
+            .extract(source)
+            .map_err(|e| (-32000, format!("Parse failed for {file}: {e}")))?;
+
+        // Method FQN → that method; class FQN → every branching method in it
+        let selected: Vec<_> = extraction
+            .methods
+            .iter()
+            .filter(|d| d.fqn() == fqn || d.class_fqn == fqn)
+            .collect();
+
+        let mut out = String::new();
+        for decision in &selected {
+            out.push_str(&format!(
+                "## {} ({file}:{})\n\n",
+                decision.fqn(),
+                decision.start_line
+            ));
+            if decision.incomplete {
+                out.push_str(
+                    "> ⚠ incomplete: the body contains unmodeled exits \
+                     (loop/switch/try); outcomes inside those are not in the table\n\n",
+                );
+            }
+            match specgraphen_logic::compress(&decision.table) {
+                Ok(compressed) => {
+                    out.push_str(&format!(
+                        "{} observed paths compressed to {} rules.\n\n",
+                        decision.table.rows().len(),
+                        compressed.rules.len()
+                    ));
+                    out.push_str(&compressed.to_markdown());
+                    out.push('\n');
+                }
+                Err(e) => {
+                    // A conflict is a genuine finding about the source logic
+                    out.push_str(&format!("> ✗ not compressible: {e}\n\n"));
+                }
+            }
+        }
+
+        let skipped: Vec<_> = extraction
+            .skipped
+            .iter()
+            .filter(|(m, _)| *m == fqn || m.starts_with(&format!("{fqn}.")))
+            .collect();
+        for (method, reason) in &skipped {
+            out.push_str(&format!("- skipped {method}: {reason}\n"));
+        }
+
+        if selected.is_empty() && skipped.is_empty() {
+            out = format!(
+                "{fqn} has no extractable branching logic \
+                 (no if/else, or only unmodeled constructs)."
+            );
+        }
+        Ok(out)
     }
 }
 

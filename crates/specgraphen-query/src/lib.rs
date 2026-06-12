@@ -58,6 +58,24 @@ impl QueryEngine {
         self
     }
 
+    /// Resolve a symbol to `(fqn, witness file, start line)` for tools that
+    /// need to re-read the underlying source.
+    pub fn witness_of(&self, symbol: &str) -> Option<(String, String, u32)> {
+        let data = self.space_data.read().unwrap();
+        let (fqn, cell_id) = resolve::resolve_symbol(&data, symbol)?;
+        let entity = data.entities.iter().find(|e| e.cell_id == cell_id)?;
+        Some((
+            fqn.to_string(),
+            entity.witness.file.clone(),
+            entity.witness.start_line,
+        ))
+    }
+
+    /// Loaded source content for a witness-relative file path, if available.
+    pub fn file_source(&self, file: &str) -> Option<&str> {
+        self.source_files.get(file).map(String::as_str)
+    }
+
     pub fn explain(&self, symbol: &str) -> Result<ExplainResult> {
         let data = self.space_data.read().unwrap();
         explain::explain(&data, symbol)
