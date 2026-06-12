@@ -135,14 +135,17 @@ Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると
 
 ## セットアップ手順
 
-### 1. ビルド
+### 1. インストール
 
 ```sh
-cd /path/to/specgraphen
-cargo build --release -p specgraphen-cli
-```
+# npx を使う場合はインストール不要（MCP 登録時に command を npx にする）
 
-バイナリは `target/release/specgraphen` に生成される。
+# シェルインストーラ (macOS / Linux)
+curl -fsSL https://github.com/fuwasegu/specgraphen/releases/latest/download/specgraphen-cli-installer.sh | sh
+
+# またはソースからビルド
+cargo install --git https://github.com/fuwasegu/specgraphen specgraphen-cli
+```
 
 ### 2. lift（初期解析）
 
@@ -166,8 +169,9 @@ specgraphen lift \
   "mcpServers": {
     "specgraphen": {
       "type": "stdio",
-      "command": "/path/to/specgraphen",
+      "command": "npx",
       "args": [
+        "-y", "specgraphen",
         "serve",
         "--space-id", "myproject",
         "--store", "/path/to/.specgraphen",

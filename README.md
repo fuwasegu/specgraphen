@@ -23,13 +23,37 @@ specgraphen solves this by:
 | Can't do cross-file call graphs | Pre-computed call graph with witnesses |
 | Tokens: 10,000-50,000 per question | Tokens: 300-2,000 per question |
 
-## Quick Start
+## Installation
 
-### Build
+### npx — recommended for MCP usage
+
+No install step — Claude Code users already have Node.js:
 
 ```sh
-cargo build --release -p specgraphen-cli
+npx -y specgraphen --help
 ```
+
+### Shell installer (macOS / Linux)
+
+```sh
+curl -fsSL https://github.com/fuwasegu/specgraphen/releases/latest/download/specgraphen-cli-installer.sh | sh
+```
+
+### PowerShell installer (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/fuwasegu/specgraphen/releases/latest/download/specgraphen-cli-installer.ps1 | iex"
+```
+
+### From source (requires Rust toolchain)
+
+```sh
+cargo install --git https://github.com/fuwasegu/specgraphen specgraphen-cli
+```
+
+Prebuilt binaries for each release are also on the [releases page](https://github.com/fuwasegu/specgraphen/releases), and `cargo binstall specgraphen-cli` picks them up automatically.
+
+## Quick Start
 
 ### Analyze a Java project
 
@@ -50,8 +74,9 @@ Add to your Claude Code project config (`.claude.json` or `mcp.json`):
   "mcpServers": {
     "specgraphen": {
       "type": "stdio",
-      "command": "/path/to/specgraphen",
+      "command": "npx",
       "args": [
+        "-y", "specgraphen",
         "serve",
         "--space-id", "myproject",
         "--store", ".specgraphen",
@@ -189,13 +214,20 @@ specgraphen は:
 2. エンティティ・関係・根拠を Higher Graphen Space に格納
 3. MCP 経由で 19 種類のクエリツールを提供 — 1回の問い合わせ、サブ秒で応答
 
-## クイックスタート
-
-### ビルド
+## インストール
 
 ```sh
-cargo build --release -p specgraphen-cli
+# npx（MCP 用途はこれが最も簡単。インストール不要）
+npx -y specgraphen --help
+
+# シェルインストーラ (macOS / Linux)
+curl -fsSL https://github.com/fuwasegu/specgraphen/releases/latest/download/specgraphen-cli-installer.sh | sh
+
+# ソースからビルド（Rust toolchain が必要）
+cargo install --git https://github.com/fuwasegu/specgraphen specgraphen-cli
 ```
+
+## クイックスタート
 
 ### Java プロジェクトを解析
 
@@ -216,8 +248,9 @@ Claude Code のプロジェクト設定（`.claude.json` または `mcp.json`）
   "mcpServers": {
     "specgraphen": {
       "type": "stdio",
-      "command": "/path/to/specgraphen",
+      "command": "npx",
       "args": [
+        "-y", "specgraphen",
         "serve",
         "--space-id", "myproject",
         "--store", ".specgraphen",

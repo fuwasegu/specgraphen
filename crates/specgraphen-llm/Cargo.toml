@@ -3,6 +3,7 @@ name = "specgraphen-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "LLM provider abstraction (Claude / OpenAI) for semantic enrichment"
 
 [dependencies]

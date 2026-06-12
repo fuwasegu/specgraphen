@@ -17,6 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/fuwasegu/specgraphen"
 
 [workspace.dependencies]
 # Higher Graphen
@@ -51,3 +52,8 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
