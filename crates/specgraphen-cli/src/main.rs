@@ -386,6 +386,54 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // JSP / tag files: JSTL conditional clusters (screen display logic)
+            let tag_extractor = specgraphen_lift::TagExtractor::new();
+            for ext in ["jsp", "tag"] {
+                let pattern = format!("{}/**/*.{ext}", root.trim_end_matches('/'));
+                for entry in glob::glob(&pattern)?.flatten() {
+                    let path_str = entry.display().to_string();
+                    if let Some(filter) = &method {
+                        if !path_str.contains(filter.as_str()) {
+                            continue;
+                        }
+                    }
+                    let source = match specgraphen_resolver::encoding::read_source(&entry, forced) {
+                        Ok(decoded) => decoded.text,
+                        Err(e) => {
+                            tracing::warn!(file = %path_str, "skipping unreadable file: {e}");
+                            continue;
+                        }
+                    };
+                    let extraction = tag_extractor.extract(&source);
+                    all_skipped.extend(
+                        extraction
+                            .skipped
+                            .into_iter()
+                            .map(|(loc, reason)| (format!("{path_str} {loc}"), reason)),
+                    );
+
+                    for cluster in extraction.clusters {
+                        match specgraphen_logic::compress(&cluster.table) {
+                            Ok(compressed) => {
+                                reported += 1;
+                                println!("## {path_str}:{}", cluster.start_line);
+                                if cluster.incomplete {
+                                    println!(
+                                        "\n> ⚠ incomplete: the file also contains scriptlet \
+                                         conditionals (<% if %>) not in this table"
+                                    );
+                                }
+                                println!("\n{}", compressed.to_markdown());
+                            }
+                            Err(e) => {
+                                println!("## {path_str}:{}", cluster.start_line);
+                                println!("\n> ✗ not compressible: {e}\n");
+                            }
+                        }
+                    }
+                }
+            }
+
             if !all_skipped.is_empty() {
                 println!("---");
                 println!("Skipped methods:");

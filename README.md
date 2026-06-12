@@ -14,7 +14,9 @@ specgraphen solves this by:
 
 1. **Pre-analyzing** the entire codebase (tree-sitter + optional LSP) into a structured graph
 2. **Storing** entities, relations, and witnesses in a Higher Graphen Space
-3. **Serving** 19 query tools via MCP — one call per question, sub-second response
+3. **Serving** 20 query tools via MCP — one call per question, sub-second response
+
+> **Java-first by design.** specgraphen targets legacy enterprise codebases: parsing, LSP integration (jdtls), and the analysis heuristics are built and field-tested for Java — plus what surrounds it in real legacy systems (Shift_JIS/EUC-JP sources, MyBatis mapper XML, SQL, and JSP/JSTL screen logic). The decision-table engine (`specgraphen-logic`) and the graph substrate are language-agnostic, so other languages can be added as front-ends, but Java is what works today.
 
 | Without specgraphen | With specgraphen |
 |---|---|
@@ -98,7 +100,7 @@ Just ask naturally:
 - "What are the columns of the Customer table and where are they used?"
 - "Explain the createUser method"
 
-## 19 MCP Tools
+## 20 MCP Tools
 
 ### Project-wide
 
@@ -176,7 +178,7 @@ Falls back to tree-sitter heuristics when LSP is unavailable.
 
 ```
 specgraphen-cli          CLI binary (lift / query / serve / export)
-specgraphen-mcp          MCP server (stdio JSON-RPC, 19 tools)
+specgraphen-mcp          MCP server (stdio JSON-RPC, 20 tools)
 specgraphen-query         Query engine + projection
 specgraphen-lift          tree-sitter Java parser → HG Space
 specgraphen-resolver      TypeResolver trait (LSP / heuristic / chain)
@@ -213,7 +215,9 @@ specgraphen は:
 
 1. コードベース全体を事前解析（tree-sitter + オプションで LSP）して構造化グラフに変換
 2. エンティティ・関係・根拠を Higher Graphen Space に格納
-3. MCP 経由で 19 種類のクエリツールを提供 — 1回の問い合わせ、サブ秒で応答
+3. MCP 経由で 20 種類のクエリツールを提供 — 1回の問い合わせ、サブ秒で応答
+
+> **設計として Java に寄せています。** specgraphen の照準はレガシーエンタープライズのコードベースで、パース・LSP 統合（jdtls）・解析ヒューリスティックは Java とその周辺（Shift_JIS/EUC-JP ソース、MyBatis mapper XML、SQL、JSP/JSTL の画面ロジック）向けに作られ、実案件で検証されています。数理コア（`specgraphen-logic`）とグラフ基盤は言語非依存なので他言語はフロントエンド追加で対応可能ですが、現時点で実用になるのは Java です。
 
 ## インストール
 
@@ -289,7 +293,7 @@ LSP を使うと型厳密なシンボル解決が可能に:
 
 LSP が使えない環境では tree-sitter ヒューリスティックに自動フォールバック。
 
-## 19 の MCP ツール
+## 20 の MCP ツール
 
 | カテゴリ | ツール | 説明 |
 |---|---|---|

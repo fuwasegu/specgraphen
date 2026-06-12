@@ -340,6 +340,8 @@ specgraphen rules \
 
 if/else に加えて、各 case が break/return/throw で終わる「クリーンな switch」も else-if 連鎖としてモデル化する（fall-through や条件付き break を含む switch は incomplete 扱い）。代入・メソッド呼び出しは観測効果として outcome に反映され、ログ系呼び出し（`logger.*` 等）は意図的に無効果扱い。
 
+`--root` 配下の `*.jsp` / `*.tag` も対象になる: JSTL の `c:if` / `c:choose` 構造を「どの条件でどのコンテンツが描画されるか」のディシジョンテーブルとして抽出する（スクリプトレット `<% if %>` を含むクラスタは incomplete 扱い）。
+
 ---
 
 ## FAQ
