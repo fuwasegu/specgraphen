@@ -33,7 +33,7 @@ cargo run -p specgraphen-cli -- export --space-id test --out SPEC.md
 
 ## Architecture
 
-Rust workspace with 10 crates:
+Rust workspace with 11 crates:
 
 - `specgraphen-model` — Domain types (JavaEntityType, JavaRelationType, SemanticAnnotation)
 - `specgraphen-lift` — tree-sitter Java → HG Space/Cell/Incidence with witnesses
@@ -45,5 +45,6 @@ Rust workspace with 10 crates:
 - `specgraphen-mcp` — MCP server (stdio transport)
 - `specgraphen-cli` — CLI binary
 - `specgraphen-resolver` — TypeResolver trait (LSP / heuristic / chain)
+- `specgraphen-logic` — Pure boolean decision-table compression (Quine-McCluskey); zero deps, no HG
 
-All crates depend on Higher Graphen (HG) crates via git dependency, pinned to a specific rev in the workspace Cargo.toml.
+All crates except `specgraphen-logic` depend on Higher Graphen (HG) crates via git dependency, pinned to a specific rev in the workspace Cargo.toml.

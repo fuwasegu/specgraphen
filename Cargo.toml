@@ -11,6 +11,7 @@ members = [
     "crates/specgraphen-mcp",
     "crates/specgraphen-cli",
     "crates/specgraphen-resolver",
+    "crates/specgraphen-logic",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ specgraphen-query = { path = "crates/specgraphen-query" }
 specgraphen-store = { path = "crates/specgraphen-store" }
 specgraphen-mcp = { path = "crates/specgraphen-mcp" }
 specgraphen-resolver = { path = "crates/specgraphen-resolver" }
+specgraphen-logic = { path = "crates/specgraphen-logic" }
 
 # External
 serde = { version = "1", features = ["derive"] }

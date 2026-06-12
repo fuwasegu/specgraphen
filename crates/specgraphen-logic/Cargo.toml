@@ -1,0 +1,9 @@
+[package]
+name = "specgraphen-logic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure boolean decision-table compression (Quine-McCluskey) for extracting core rules from legacy branching logic"
+
+[dependencies]
