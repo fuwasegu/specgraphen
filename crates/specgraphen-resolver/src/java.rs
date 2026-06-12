@@ -17,6 +17,9 @@ pub struct JavaLspOptions {
     /// Source roots relative to the workspace root (e.g. `src/main/java`).
     /// When empty, roots are auto-detected from package declarations.
     pub source_roots: Vec<String>,
+    /// Source file encoding label (e.g. `shift_jis`, `windows-31j`).
+    /// When unset, encoding is detected per file (UTF-8 → Shift_JIS → EUC-JP).
+    pub source_encoding: Option<String>,
 }
 
 impl Default for JavaLspOptions {
@@ -24,8 +27,19 @@ impl Default for JavaLspOptions {
         Self {
             init_timeout: Duration::from_secs(60),
             source_roots: Vec::new(),
+            source_encoding: None,
         }
     }
+}
+
+/// Counts of files sent to jdtls via `didOpen`, for the lift summary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenStats {
+    pub opened: usize,
+    /// Opened, but some bytes could not be decoded and were replaced.
+    pub lossy: usize,
+    /// Could not be read at all (I/O error); not opened.
+    pub failed: usize,
 }
 
 pub struct JavaLspResolver {
@@ -34,7 +48,9 @@ pub struct JavaLspResolver {
     /// FQN prefixes derived from source roots (e.g. `src.main.java.`), stripped
     /// when converting result paths to FQNs.
     source_root_prefixes: Vec<String>,
+    forced_encoding: Option<&'static encoding_rs::Encoding>,
     opened_files: Mutex<HashSet<String>>,
+    open_stats: Mutex<OpenStats>,
     cache: tokio::sync::RwLock<HashMap<String, Vec<ResolvedSymbol>>>,
 }
 
@@ -51,6 +67,12 @@ impl JavaLspResolver {
         })?;
         let workspace_root = workspace_root.as_path();
 
+        let forced_encoding = options
+            .source_encoding
+            .as_deref()
+            .map(crate::encoding::resolve_encoding)
+            .transpose()?;
+
         let jdtls_cmd = find_jdtls()?;
         tracing::info!(command = %jdtls_cmd, "Starting jdtls");
 
@@ -62,15 +84,29 @@ impl JavaLspResolver {
                 .to_string_lossy()
         ));
 
+        // jdtls reads unopened files from disk with the JVM default charset, so
+        // an explicit source encoding must reach the JVM too.
+        let mut envs = Vec::new();
+        if let Some(label) = &options.source_encoding {
+            let existing = std::env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
+            envs.push((
+                "JAVA_TOOL_OPTIONS".to_string(),
+                format!("{existing} -Dfile.encoding={label}")
+                    .trim()
+                    .to_string(),
+            ));
+        }
+
         let mut client = LspClient::spawn(
             &jdtls_cmd,
             &["-data", &data_dir.to_string_lossy()],
             workspace_root,
+            &envs,
         )
         .await?;
 
         let source_roots = if options.source_roots.is_empty() {
-            let detected = detect_source_roots(workspace_root);
+            let detected = detect_source_roots(workspace_root, forced_encoding);
             tracing::info!(roots = ?detected, "Auto-detected Java source roots");
             detected
         } else {
@@ -115,9 +151,17 @@ impl JavaLspResolver {
             client: Arc::new(Mutex::new(client)),
             workspace_root: workspace_root.to_path_buf(),
             source_root_prefixes,
+            forced_encoding,
             opened_files: Mutex::new(HashSet::new()),
+            open_stats: Mutex::new(OpenStats::default()),
             cache: tokio::sync::RwLock::new(HashMap::new()),
         })
+    }
+
+    /// didOpen accounting so callers can surface how many files were sent to
+    /// jdtls, decoded lossily, or dropped.
+    pub async fn open_stats(&self) -> OpenStats {
+        *self.open_stats.lock().await
     }
 
     fn abs_path(&self, file: &str) -> PathBuf {
@@ -140,17 +184,35 @@ impl JavaLspResolver {
             return uri;
         }
 
-        match tokio::fs::read_to_string(&abs).await {
-            Ok(text) => match client.did_open(&uri, "java", &text).await {
-                Ok(()) => {
-                    opened.insert(uri.clone());
-                }
-                Err(e) => {
-                    tracing::warn!(file = %abs.display(), "didOpen failed: {e}");
-                }
-            },
+        let decoded = match tokio::fs::read(&abs).await {
+            Ok(bytes) => crate::encoding::decode_source(&bytes, self.forced_encoding),
             Err(e) => {
                 tracing::warn!(file = %abs.display(), "Failed to read file for didOpen: {e}");
+                self.open_stats.lock().await.failed += 1;
+                return uri;
+            }
+        };
+
+        if decoded.lossy {
+            tracing::debug!(
+                file = %abs.display(),
+                encoding = decoded.encoding,
+                "didOpen text decoded lossily (some bytes replaced)"
+            );
+        }
+
+        match client.did_open(&uri, "java", &decoded.text).await {
+            Ok(()) => {
+                opened.insert(uri.clone());
+                let mut stats = self.open_stats.lock().await;
+                stats.opened += 1;
+                if decoded.lossy {
+                    stats.lossy += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(file = %abs.display(), "didOpen failed: {e}");
+                self.open_stats.lock().await.failed += 1;
             }
         }
 
@@ -416,7 +478,10 @@ fn uri_to_fqn(uri: &str, workspace_root: &Path, source_root_prefixes: &[String])
 /// Detect source roots by comparing each Java file's `package` declaration with
 /// its directory: for `a/b/com/example/Foo.java` declaring `package com.example;`,
 /// the source root is `a/b`. Returns roots relative to the workspace root.
-fn detect_source_roots(workspace_root: &Path) -> Vec<String> {
+fn detect_source_roots(
+    workspace_root: &Path,
+    forced_encoding: Option<&'static encoding_rs::Encoding>,
+) -> Vec<String> {
     let mut roots = BTreeSet::new();
     let mut stack = vec![workspace_root.to_path_buf()];
 
@@ -435,7 +500,7 @@ fn detect_source_roots(workspace_root: &Path) -> Vec<String> {
                 }
             } else if !dir_done && name.ends_with(".java") {
                 dir_done = true;
-                if let Some(root) = source_root_of(workspace_root, &dir, &path) {
+                if let Some(root) = source_root_of(workspace_root, &dir, &path, forced_encoding) {
                     roots.insert(root);
                 }
             }
@@ -445,8 +510,13 @@ fn detect_source_roots(workspace_root: &Path) -> Vec<String> {
     roots.into_iter().collect()
 }
 
-fn source_root_of(workspace_root: &Path, dir: &Path, java_file: &Path) -> Option<String> {
-    let package = read_package_declaration(java_file)?;
+fn source_root_of(
+    workspace_root: &Path,
+    dir: &Path,
+    java_file: &Path,
+    forced_encoding: Option<&'static encoding_rs::Encoding>,
+) -> Option<String> {
+    let package = read_package_declaration(java_file, forced_encoding)?;
     let package_path = package.replace('.', "/");
 
     let rel_dir = dir
@@ -467,8 +537,13 @@ fn source_root_of(workspace_root: &Path, dir: &Path, java_file: &Path) -> Option
     }
 }
 
-fn read_package_declaration(java_file: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(java_file).ok()?;
+fn read_package_declaration(
+    java_file: &Path,
+    forced_encoding: Option<&'static encoding_rs::Encoding>,
+) -> Option<String> {
+    let content = crate::encoding::read_source(java_file, forced_encoding)
+        .ok()?
+        .text;
     for line in content.lines().take(100) {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("package ") {
@@ -488,7 +563,7 @@ mod tests {
 
     #[test]
     fn detects_standard_maven_source_root() {
-        let roots = detect_source_roots(&fixture_root());
+        let roots = detect_source_roots(&fixture_root(), None);
         assert_eq!(roots, vec!["src/main/java".to_string()]);
     }
 
@@ -498,7 +573,7 @@ mod tests {
         let dir = root.join("src/main/java/com/example/model");
         let file = dir.join("User.java");
         assert_eq!(
-            source_root_of(&root, &dir, &file),
+            source_root_of(&root, &dir, &file, None),
             Some("src/main/java".to_string())
         );
     }
@@ -509,7 +584,25 @@ mod tests {
         // Directory does not end with the declared package path
         let dir = root.join("src/main/java");
         let file = root.join("src/main/java/com/example/model/User.java");
-        assert_eq!(source_root_of(&root, &dir, &file), None);
+        assert_eq!(source_root_of(&root, &dir, &file, None), None);
+    }
+
+    #[test]
+    fn reads_package_declaration_from_shift_jis_file() {
+        // "package com.example;\n// <SJIS 日本語コメント>\nclass A {}\n"
+        let mut bytes = b"package com.example;\n// ".to_vec();
+        bytes.extend_from_slice(&[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA]); // 日本語 in Shift_JIS
+        bytes.extend_from_slice(b"\nclass A {}\n");
+
+        let dir = std::env::temp_dir().join("specgraphen-sjis-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("A.java");
+        std::fs::write(&file, &bytes).unwrap();
+
+        assert_eq!(
+            read_package_declaration(&file, None),
+            Some("com.example".to_string())
+        );
     }
 
     #[test]

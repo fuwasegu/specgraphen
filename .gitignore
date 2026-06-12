@@ -8,3 +8,6 @@
 # Local tool configuration (contains machine-specific paths)
 .claude/
 .serena/
+
+# Local analysis notes (may reference confidential analysis targets)
+/docs/

@@ -158,6 +158,9 @@ specgraphen lift \
 
 **オプション**:
 - `--lsp java`: jdtls で型解決を強化（jdtls が必要）
+- `--source-encoding shift_jis`: ソースの文字コードを明示指定（省略時は UTF-8 → Shift_JIS → EUC-JP の順で自動判定）。レガシー日本語コードベースで didOpen 警告が出る場合に指定
+- `--source-root webapp/src`: Java ソースルートを明示指定（複数指定可。省略時は package 宣言から自動検出）
+- `--lsp-init-timeout 300`: jdtls のインデックス完了待ちの秒数（デフォルト 60。大規模コードベースで延長）
 - `--llm-provider claude --llm-api-key $KEY`: LLM で意味注釈を自動追加
 
 ### 3. MCP 登録
@@ -293,6 +296,9 @@ specgraphen lift \
   --space-id <プロジェクト識別子> \
   [--store <保存先ディレクトリ>]          # デフォルト: .specgraphen
   [--lsp java]                           # jdtls で型解決を強化
+  [--source-encoding <charset>]          # ソースの文字コード（例 shift_jis。省略時は自動判定）
+  [--source-root <dir>]                  # Java ソースルート（複数可。省略時は自動検出）
+  [--lsp-init-timeout <秒>]              # jdtls の準備待ちタイムアウト（デフォルト 60）
   [--llm-provider claude|openai]         # LLM で意味注釈を自動追加
   [--llm-api-key <API key>]              # または環境変数 ANTHROPIC_API_KEY
   [--llm-model <モデル名>]

@@ -1,6 +1,7 @@
 //! `TypeResolver` trait with LSP-backed and heuristic implementations.
 
 pub mod chain;
+pub mod encoding;
 pub mod heuristic;
 pub mod java;
 pub mod lsp_client;

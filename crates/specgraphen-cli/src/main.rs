@@ -43,6 +43,9 @@ enum Commands {
         /// Java source root relative to --root (repeatable; auto-detected if omitted)
         #[arg(long)]
         source_root: Vec<String>,
+        /// Source file encoding for LSP (e.g. shift_jis, windows-31j; auto-detected if omitted)
+        #[arg(long)]
+        source_encoding: Option<String>,
     },
     Query {
         #[command(subcommand)]
@@ -105,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
             lsp,
             lsp_init_timeout,
             source_root,
+            source_encoding,
         } => {
             let mut lifter = specgraphen_lift::JavaLifter::new()?;
 
@@ -115,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
                         let lsp_options = specgraphen_resolver::java::JavaLspOptions {
                             init_timeout: std::time::Duration::from_secs(lsp_init_timeout),
                             source_roots: source_root,
+                            source_encoding,
                         };
                         build_lsp_cache_java(&mut lifter, &root, &space_id, lsp_options).await
                     }
@@ -476,6 +481,19 @@ async fn build_lsp_cache_java(
         total = unique_unresolved.len(),
         "LSP resolution complete"
     );
+
+    let stats = resolver.open_stats().await;
+    if stats.failed > 0 || stats.lossy > 0 {
+        tracing::warn!(
+            opened = stats.opened,
+            lossy = stats.lossy,
+            failed = stats.failed,
+            "Some source files could not be opened cleanly for LSP \
+             (consider --source-encoding, e.g. --source-encoding shift_jis)"
+        );
+    } else {
+        tracing::info!(opened = stats.opened, "didOpen file stats");
+    }
 
     cache
 }

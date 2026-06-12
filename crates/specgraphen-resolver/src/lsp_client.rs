@@ -14,9 +14,15 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    pub async fn spawn(command: &str, args: &[&str], workspace_root: &Path) -> Result<Self> {
+    pub async fn spawn(
+        command: &str,
+        args: &[&str],
+        workspace_root: &Path,
+        envs: &[(String, String)],
+    ) -> Result<Self> {
         let mut child = Command::new(command)
             .args(args)
+            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
