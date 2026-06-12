@@ -36,10 +36,14 @@ impl LspClient {
         })
     }
 
-    pub async fn initialize(&mut self, workspace_root: &Path) -> Result<serde_json::Value> {
+    pub async fn initialize(
+        &mut self,
+        workspace_root: &Path,
+        initialization_options: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         let root_uri = path_to_file_uri(workspace_root);
 
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -59,6 +63,10 @@ impl LspClient {
             }]
         });
 
+        if let Some(options) = initialization_options {
+            params["initializationOptions"] = options;
+        }
+
         let result = self.send_request("initialize", params).await?;
         self.send_notification("initialized", serde_json::json!({}))
             .await?;
@@ -66,6 +74,51 @@ impl LspClient {
 
         tracing::info!("LSP server initialized");
         Ok(result)
+    }
+
+    /// Wait until the server reports readiness via a `language/status` notification
+    /// (jdtls sends `type: "ServiceReady"` once language services are available).
+    /// Returns `false` if the timeout elapsed without seeing the notification.
+    pub async fn wait_for_ready(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return Ok(false);
+            };
+            let message = match tokio::time::timeout(remaining, self.read_message()).await {
+                Err(_) => return Ok(false),
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(m)) => m,
+            };
+            if message["method"].as_str() == Some("language/status") {
+                match message["params"]["type"].as_str().unwrap_or("") {
+                    "ServiceReady" => return Ok(true),
+                    "Error" => {
+                        tracing::warn!(
+                            message = %message["params"]["message"],
+                            "LSP server reported an error during startup"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub async fn did_open(&mut self, uri: &str, language_id: &str, text: &str) -> Result<()> {
+        self.send_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        )
+        .await
     }
 
     pub async fn hover(&mut self, file: &str, line: u32, col: u32) -> Result<Option<String>> {
@@ -173,31 +226,35 @@ impl LspClient {
         Ok(())
     }
 
+    async fn read_message(&mut self) -> Result<serde_json::Value> {
+        // Read Content-Length header
+        let mut header = String::new();
+        loop {
+            let mut line = String::new();
+            self.stdout.read_line(&mut line).await?;
+            if line.trim().is_empty() {
+                break;
+            }
+            header.push_str(&line);
+        }
+
+        let content_length: usize = header
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("Content-Length: ")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .context("Missing Content-Length header")?;
+
+        let mut body = vec![0u8; content_length];
+        self.stdout.read_exact(&mut body).await?;
+
+        Ok(serde_json::from_slice(&body)?)
+    }
+
     async fn read_response(&mut self, expected_id: u64) -> Result<serde_json::Value> {
         loop {
-            // Read Content-Length header
-            let mut header = String::new();
-            loop {
-                let mut line = String::new();
-                self.stdout.read_line(&mut line).await?;
-                if line.trim().is_empty() {
-                    break;
-                }
-                header.push_str(&line);
-            }
-
-            let content_length: usize = header
-                .lines()
-                .find_map(|l| {
-                    l.strip_prefix("Content-Length: ")
-                        .and_then(|v| v.trim().parse().ok())
-                })
-                .context("Missing Content-Length header")?;
-
-            let mut body = vec![0u8; content_length];
-            self.stdout.read_exact(&mut body).await?;
-
-            let response: serde_json::Value = serde_json::from_slice(&body)?;
+            let response = self.read_message().await?;
 
             // Skip notifications (no id field)
             if response.get("id").is_none() {

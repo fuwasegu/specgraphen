@@ -93,6 +93,6 @@ fn make_provenance(witness: &WitnessInfo) -> Provenance {
         .with_title(witness.file.clone())
         .expect("valid title");
     Provenance::new(source_ref, Confidence::new(0.95).expect("valid confidence"))
-        .with_extraction_method("tree-sitter-java")
+        .with_extraction_method(witness.derivation_source.extraction_method_str())
         .expect("valid extraction method")
 }

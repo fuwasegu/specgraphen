@@ -37,6 +37,12 @@ enum Commands {
         /// Enable LSP type resolution (java)
         #[arg(long)]
         lsp: Option<String>,
+        /// Seconds to wait for the LSP server to finish indexing (default: 60)
+        #[arg(long, default_value_t = 60)]
+        lsp_init_timeout: u64,
+        /// Java source root relative to --root (repeatable; auto-detected if omitted)
+        #[arg(long)]
+        source_root: Vec<String>,
     },
     Query {
         #[command(subcommand)]
@@ -97,13 +103,21 @@ async fn main() -> anyhow::Result<()> {
             llm_model,
             llm_base_url,
             lsp,
+            lsp_init_timeout,
+            source_root,
         } => {
             let mut lifter = specgraphen_lift::JavaLifter::new()?;
 
             // Build LSP resolver cache if requested
             let resolved_cache = if let Some(ref lsp_lang) = lsp {
                 match lsp_lang.as_str() {
-                    "java" => build_lsp_cache_java(&mut lifter, &root, &space_id).await,
+                    "java" => {
+                        let lsp_options = specgraphen_resolver::java::JavaLspOptions {
+                            init_timeout: std::time::Duration::from_secs(lsp_init_timeout),
+                            source_roots: source_root,
+                        };
+                        build_lsp_cache_java(&mut lifter, &root, &space_id, lsp_options).await
+                    }
                     other => {
                         tracing::warn!("Unknown LSP language: {other}. Supported: java");
                         std::collections::HashMap::new()
@@ -365,6 +379,7 @@ async fn build_lsp_cache_java(
     lifter: &mut specgraphen_lift::JavaLifter,
     root: &str,
     space_id: &str,
+    lsp_options: specgraphen_resolver::java::JavaLspOptions,
 ) -> std::collections::HashMap<String, String> {
     use specgraphen_resolver::TypeResolver;
     tracing::info!("Starting LSP resolver (jdtls)...");
@@ -372,13 +387,14 @@ async fn build_lsp_cache_java(
     let root_path = PathBuf::from(root);
 
     // Step 1: Start jdtls
-    let resolver = match specgraphen_resolver::java::JavaLspResolver::new(&root_path).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Failed to start jdtls: {e}. Falling back to heuristic resolution.");
-            return std::collections::HashMap::new();
-        }
-    };
+    let resolver =
+        match specgraphen_resolver::java::JavaLspResolver::new(&root_path, lsp_options).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Failed to start jdtls: {e}. Falling back to heuristic resolution.");
+                return std::collections::HashMap::new();
+            }
+        };
     tracing::info!("jdtls ready.");
 
     // Step 2: Run tree-sitter pass to collect unresolved symbols
@@ -429,7 +445,8 @@ async fn build_lsp_cache_java(
 
     for (i, u) in unique_unresolved.iter().enumerate() {
         let ctx = specgraphen_resolver::ResolveContext {
-            file: format!("{}/{}", root_path.display(), u.file),
+            // May be workspace-relative or absolute; the resolver normalizes it
+            file: u.file.clone(),
             line: u.line,
             column: u.column,
             package: None,

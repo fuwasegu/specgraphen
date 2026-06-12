@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -9,14 +10,47 @@ use tokio::sync::Mutex;
 use crate::lsp_client::LspClient;
 use crate::{ResolutionSource, ResolveContext, ResolvedSymbol, SymbolKind, TypeResolver};
 
+#[derive(Debug, Clone)]
+pub struct JavaLspOptions {
+    /// How long to wait for jdtls to report `ServiceReady` before proceeding anyway.
+    pub init_timeout: Duration,
+    /// Source roots relative to the workspace root (e.g. `src/main/java`).
+    /// When empty, roots are auto-detected from package declarations.
+    pub source_roots: Vec<String>,
+}
+
+impl Default for JavaLspOptions {
+    fn default() -> Self {
+        Self {
+            init_timeout: Duration::from_secs(60),
+            source_roots: Vec::new(),
+        }
+    }
+}
+
 pub struct JavaLspResolver {
     client: Arc<Mutex<LspClient>>,
     workspace_root: PathBuf,
+    /// FQN prefixes derived from source roots (e.g. `src.main.java.`), stripped
+    /// when converting result paths to FQNs.
+    source_root_prefixes: Vec<String>,
+    opened_files: Mutex<HashSet<String>>,
     cache: tokio::sync::RwLock<HashMap<String, Vec<ResolvedSymbol>>>,
 }
 
 impl JavaLspResolver {
-    pub async fn new(workspace_root: &Path) -> Result<Self> {
+    pub async fn new(workspace_root: &Path, options: JavaLspOptions) -> Result<Self> {
+        // Canonicalize so file URIs are absolute (`file://./x` is rejected by
+        // jdtls: the relative segment is parsed as a URI authority) and so
+        // result paths from jdtls can be stripped back to workspace-relative.
+        let workspace_root = workspace_root.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "Cannot canonicalize workspace root {}: {e}",
+                workspace_root.display()
+            )
+        })?;
+        let workspace_root = workspace_root.as_path();
+
         let jdtls_cmd = find_jdtls()?;
         tracing::info!(command = %jdtls_cmd, "Starting jdtls");
 
@@ -35,26 +69,92 @@ impl JavaLspResolver {
         )
         .await?;
 
-        client.initialize(workspace_root).await?;
+        let source_roots = if options.source_roots.is_empty() {
+            let detected = detect_source_roots(workspace_root);
+            tracing::info!(roots = ?detected, "Auto-detected Java source roots");
+            detected
+        } else {
+            options.source_roots.clone()
+        };
 
-        // Give jdtls time to index
+        // Without a build definition (pom.xml / build.gradle / .classpath), jdtls
+        // treats the workspace as an "invisible project" and needs the source
+        // roots and libraries passed explicitly to build a project model.
+        let init_options = serde_json::json!({
+            "settings": {
+                "java": {
+                    "project": {
+                        "sourcePaths": source_roots,
+                        "referencedLibraries": ["**/*.jar"]
+                    }
+                }
+            }
+        });
+
+        client
+            .initialize(workspace_root, Some(init_options))
+            .await?;
+
         tracing::info!("Waiting for jdtls to index workspace...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        match client.wait_for_ready(options.init_timeout).await {
+            Ok(true) => tracing::info!("jdtls reported ServiceReady"),
+            Ok(false) => tracing::warn!(
+                timeout_secs = options.init_timeout.as_secs(),
+                "jdtls did not report ServiceReady within the timeout; \
+                 proceeding anyway (resolution may be incomplete)"
+            ),
+            Err(e) => return Err(e),
+        }
+
+        let source_root_prefixes = source_roots
+            .iter()
+            .map(|r| format!("{}.", r.trim_matches('/').replace(['/', '\\'], ".")))
+            .collect();
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             workspace_root: workspace_root.to_path_buf(),
+            source_root_prefixes,
+            opened_files: Mutex::new(HashSet::new()),
             cache: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
 
-    fn file_uri(&self, file: &str) -> String {
-        let abs_path = if Path::new(file).is_absolute() {
+    fn abs_path(&self, file: &str) -> PathBuf {
+        if Path::new(file).is_absolute() {
             PathBuf::from(file)
         } else {
             self.workspace_root.join(file)
-        };
-        path_to_uri(&abs_path)
+        }
+    }
+
+    /// jdtls only answers position-based requests for files opened as working
+    /// copies, so lazily send `textDocument/didOpen` before the first request
+    /// touching each file. Returns the file URI.
+    async fn ensure_open(&self, client: &mut LspClient, file: &str) -> String {
+        let abs = self.abs_path(file);
+        let uri = path_to_uri(&abs);
+
+        let mut opened = self.opened_files.lock().await;
+        if opened.contains(&uri) {
+            return uri;
+        }
+
+        match tokio::fs::read_to_string(&abs).await {
+            Ok(text) => match client.did_open(&uri, "java", &text).await {
+                Ok(()) => {
+                    opened.insert(uri.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(file = %abs.display(), "didOpen failed: {e}");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(file = %abs.display(), "Failed to read file for didOpen: {e}");
+            }
+        }
+
+        uri
     }
 }
 
@@ -71,8 +171,8 @@ impl TypeResolver for JavaLspResolver {
             }
         }
 
-        let file = self.file_uri(&ctx.file);
         let mut client = self.client.lock().await;
+        let file = self.ensure_open(&mut client, &ctx.file).await;
 
         let results = match client
             .definition(&file, ctx.line.saturating_sub(1), ctx.column)
@@ -81,7 +181,8 @@ impl TypeResolver for JavaLspResolver {
             Ok(locations) => locations
                 .into_iter()
                 .filter_map(|loc| {
-                    let fqn = uri_to_fqn(&loc.uri, &self.workspace_root);
+                    let fqn =
+                        uri_to_fqn(&loc.uri, &self.workspace_root, &self.source_root_prefixes);
                     fqn.map(|fqn| ResolvedSymbol {
                         fqn,
                         kind: SymbolKind::Class,
@@ -127,8 +228,8 @@ impl TypeResolver for JavaLspResolver {
             }
         }
 
-        let file = self.file_uri(&ctx.file);
         let mut client = self.client.lock().await;
+        let file = self.ensure_open(&mut client, &ctx.file).await;
 
         let results = match client
             .definition(&file, ctx.line.saturating_sub(1), ctx.column)
@@ -137,7 +238,8 @@ impl TypeResolver for JavaLspResolver {
             Ok(locations) => locations
                 .into_iter()
                 .filter_map(|loc| {
-                    let fqn = uri_to_fqn(&loc.uri, &self.workspace_root);
+                    let fqn =
+                        uri_to_fqn(&loc.uri, &self.workspace_root, &self.source_root_prefixes);
                     fqn.map(|fqn| ResolvedSymbol {
                         fqn,
                         kind: SymbolKind::Method,
@@ -162,8 +264,8 @@ impl TypeResolver for JavaLspResolver {
     }
 
     async fn find_references(&self, _fqn: &str, ctx: &ResolveContext) -> Vec<ResolvedSymbol> {
-        let file = self.file_uri(&ctx.file);
         let mut client = self.client.lock().await;
+        let file = self.ensure_open(&mut client, &ctx.file).await;
 
         match client
             .references(&file, ctx.line.saturating_sub(1), ctx.column)
@@ -288,7 +390,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&result).to_string()
 }
 
-fn uri_to_fqn(uri: &str, workspace_root: &Path) -> Option<String> {
+fn uri_to_fqn(uri: &str, workspace_root: &Path, source_root_prefixes: &[String]) -> Option<String> {
     let path = uri_to_path(uri);
     let rel = Path::new(&path)
         .strip_prefix(workspace_root)
@@ -299,13 +401,145 @@ fn uri_to_fqn(uri: &str, workspace_root: &Path) -> Option<String> {
     // Convert file path to FQN: src/main/java/com/example/Foo.java → com.example.Foo
     let fqn = rel.trim_end_matches(".java").replace(['/', '\\'], ".");
 
-    // Strip common source root prefixes
-    let fqn = fqn
-        .strip_prefix("src.main.java.")
+    // Strip the source root prefix (detected/configured roots first, then common defaults)
+    let fqn = source_root_prefixes
+        .iter()
+        .find_map(|p| fqn.strip_prefix(p.as_str()))
+        .or_else(|| fqn.strip_prefix("src.main.java."))
         .or_else(|| fqn.strip_prefix("src."))
-        .or_else(|| fqn.strip_prefix("webapp.wssrc."))
         .unwrap_or(&fqn)
         .to_string();
 
     Some(fqn)
+}
+
+/// Detect source roots by comparing each Java file's `package` declaration with
+/// its directory: for `a/b/com/example/Foo.java` declaring `package com.example;`,
+/// the source root is `a/b`. Returns roots relative to the workspace root.
+fn detect_source_roots(workspace_root: &Path) -> Vec<String> {
+    let mut roots = BTreeSet::new();
+    let mut stack = vec![workspace_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // One .java file per directory is enough to determine its source root
+        let mut dir_done = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                    stack.push(path);
+                }
+            } else if !dir_done && name.ends_with(".java") {
+                dir_done = true;
+                if let Some(root) = source_root_of(workspace_root, &dir, &path) {
+                    roots.insert(root);
+                }
+            }
+        }
+    }
+
+    roots.into_iter().collect()
+}
+
+fn source_root_of(workspace_root: &Path, dir: &Path, java_file: &Path) -> Option<String> {
+    let package = read_package_declaration(java_file)?;
+    let package_path = package.replace('.', "/");
+
+    let rel_dir = dir
+        .strip_prefix(workspace_root)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let root = rel_dir
+        .strip_suffix(&package_path)?
+        .trim_end_matches('/')
+        .to_string();
+
+    if root.is_empty() {
+        None // package root is the workspace root itself; nothing to configure
+    } else {
+        Some(root)
+    }
+}
+
+fn read_package_declaration(java_file: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(java_file).ok()?;
+    for line in content.lines().take(100) {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("package ") {
+            return Some(rest.trim_end_matches(';').trim().to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/simple-project")
+    }
+
+    #[test]
+    fn detects_standard_maven_source_root() {
+        let roots = detect_source_roots(&fixture_root());
+        assert_eq!(roots, vec!["src/main/java".to_string()]);
+    }
+
+    #[test]
+    fn source_root_of_uses_package_declaration() {
+        let root = fixture_root();
+        let dir = root.join("src/main/java/com/example/model");
+        let file = dir.join("User.java");
+        assert_eq!(
+            source_root_of(&root, &dir, &file),
+            Some("src/main/java".to_string())
+        );
+    }
+
+    #[test]
+    fn source_root_of_rejects_mismatched_package() {
+        let root = fixture_root();
+        // Directory does not end with the declared package path
+        let dir = root.join("src/main/java");
+        let file = root.join("src/main/java/com/example/model/User.java");
+        assert_eq!(source_root_of(&root, &dir, &file), None);
+    }
+
+    #[test]
+    fn uri_to_fqn_strips_detected_source_root() {
+        let prefixes = vec!["server.javasrc.".to_string()];
+        let fqn = uri_to_fqn(
+            "file:///work/server/javasrc/com/example/Foo.java",
+            Path::new("/work"),
+            &prefixes,
+        );
+        assert_eq!(fqn, Some("com.example.Foo".to_string()));
+    }
+
+    #[test]
+    fn uri_to_fqn_falls_back_to_common_roots() {
+        let fqn = uri_to_fqn(
+            "file:///work/src/main/java/com/example/Foo.java",
+            Path::new("/work"),
+            &[],
+        );
+        assert_eq!(fqn, Some("com.example.Foo".to_string()));
+    }
+
+    #[test]
+    fn uri_to_fqn_ignores_paths_outside_workspace() {
+        let fqn = uri_to_fqn(
+            "file:///elsewhere/com/example/Foo.java",
+            Path::new("/work"),
+            &[],
+        );
+        assert_eq!(fqn, None);
+    }
 }

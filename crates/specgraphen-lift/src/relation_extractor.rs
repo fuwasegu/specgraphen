@@ -362,8 +362,10 @@ impl RelationExtractor {
             .child_by_field_name("object")
             .map(|n| n.utf8_text(source).unwrap_or_default().to_string());
 
-        let candidate_fqns = self.resolve_call_target(&method_name, object_text.as_deref());
-        let witness = self.make_witness(node);
+        let (candidate_fqns, derivation) =
+            self.resolve_call_target(&method_name, object_text.as_deref());
+        let mut witness = self.make_witness(node);
+        witness.derivation_source = derivation;
 
         let mut resolved = false;
         for fqn in &candidate_fqns {
@@ -417,8 +419,9 @@ impl RelationExtractor {
             None => return,
         };
 
-        let witness = self.make_witness(node);
-        let candidate_fqns = self.resolve_type_name(&type_name);
+        let (candidate_fqns, derivation) = self.resolve_type_name(&type_name);
+        let mut witness = self.make_witness(node);
+        witness.derivation_source = derivation;
 
         let mut resolved = false;
         for fqn in &candidate_fqns {
@@ -457,8 +460,9 @@ impl RelationExtractor {
         for child in node.children(&mut cursor) {
             if child.kind() == "type_identifier" || child.kind() == "scoped_type_identifier" {
                 let type_name = child.utf8_text(source).unwrap_or_default().to_string();
-                let witness = self.make_witness(child);
-                let candidate_fqns = self.resolve_type_name(&type_name);
+                let (candidate_fqns, derivation) = self.resolve_type_name(&type_name);
+                let mut witness = self.make_witness(child);
+                witness.derivation_source = derivation;
 
                 for fqn in &candidate_fqns {
                     if let Some(to_id) = self.fqn_to_cell_id.get(fqn).cloned() {
@@ -488,8 +492,9 @@ impl RelationExtractor {
         for child in node.children(&mut cursor) {
             if child.kind() == "type_identifier" || child.kind() == "scoped_type_identifier" {
                 let type_name = child.utf8_text(source).unwrap_or_default().to_string();
-                let witness = self.make_witness(child);
-                let candidate_fqns = self.resolve_type_name(&type_name);
+                let (candidate_fqns, derivation) = self.resolve_type_name(&type_name);
+                let mut witness = self.make_witness(child);
+                witness.derivation_source = derivation;
 
                 for fqn in &candidate_fqns {
                     if let Some(to_id) = self.fqn_to_cell_id.get(fqn).cloned() {
@@ -527,8 +532,9 @@ impl RelationExtractor {
             if child.kind() == "marker_annotation" || child.kind() == "annotation" {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let ann_name = name_node.utf8_text(source).unwrap_or_default().to_string();
-                    let witness = self.make_witness(child);
-                    let candidate_fqns = self.resolve_type_name(&ann_name);
+                    let (candidate_fqns, derivation) = self.resolve_type_name(&ann_name);
+                    let mut witness = self.make_witness(child);
+                    witness.derivation_source = derivation;
 
                     for fqn in &candidate_fqns {
                         if let Some(to_id) = self.fqn_to_cell_id.get(fqn).cloned() {
@@ -547,7 +553,13 @@ impl RelationExtractor {
         }
     }
 
-    fn resolve_call_target(&self, method_name: &str, object: Option<&str>) -> Vec<String> {
+    /// Returns candidate FQNs and the source that produced them
+    /// (`Lsp` on a resolver-cache hit, `TreeSitter` for heuristic candidates).
+    fn resolve_call_target(
+        &self,
+        method_name: &str,
+        object: Option<&str>,
+    ) -> (Vec<String>, DerivationSource) {
         // Check LSP resolver cache first
         let cache_key = if let Some(obj) = object {
             format!("{obj}.{method_name}")
@@ -555,7 +567,7 @@ impl RelationExtractor {
             method_name.to_string()
         };
         if let Some(resolved_fqn) = self.resolved_cache.get(&cache_key) {
-            return vec![resolved_fqn.clone()];
+            return (vec![resolved_fqn.clone()], DerivationSource::Lsp);
         }
 
         let mut candidates = Vec::new();
@@ -570,13 +582,13 @@ impl RelationExtractor {
             candidates.push(format!("{class_fqn}.{method_name}"));
         }
 
-        candidates
+        (candidates, DerivationSource::TreeSitter)
     }
 
-    fn resolve_type_name(&self, type_name: &str) -> Vec<String> {
+    fn resolve_type_name(&self, type_name: &str) -> (Vec<String>, DerivationSource) {
         // Check LSP resolver cache first
         if let Some(resolved_fqn) = self.resolved_cache.get(type_name) {
-            return vec![resolved_fqn.clone()];
+            return (vec![resolved_fqn.clone()], DerivationSource::Lsp);
         }
 
         let mut candidates = Vec::new();
@@ -598,7 +610,7 @@ impl RelationExtractor {
             }
         }
 
-        candidates
+        (candidates, DerivationSource::TreeSitter)
     }
 
     fn build_fqn(&self, name: &str) -> String {
