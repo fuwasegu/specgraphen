@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/specgraphen-model",
+    "crates/specgraphen-lift",
+    "crates/specgraphen-llm",
+    "crates/specgraphen-corroboration",
+    "crates/specgraphen-invariant",
+    "crates/specgraphen-query",
+    "crates/specgraphen-store",
+    "crates/specgraphen-mcp",
+    "crates/specgraphen-cli",
+    "crates/specgraphen-resolver",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Higher Graphen
+higher-graphen-core = { git = "https://github.com/CAPHTECH/higher-graphen.git", rev = "f78e0205558c284cbb98fc706ba1caf14f40908e" }
+higher-graphen-structure = { git = "https://github.com/CAPHTECH/higher-graphen.git", rev = "f78e0205558c284cbb98fc706ba1caf14f40908e" }
+higher-graphen-reasoning = { git = "https://github.com/CAPHTECH/higher-graphen.git", rev = "f78e0205558c284cbb98fc706ba1caf14f40908e" }
+higher-graphen-evidence = { git = "https://github.com/CAPHTECH/higher-graphen.git", rev = "f78e0205558c284cbb98fc706ba1caf14f40908e" }
+higher-graphen-projection = { git = "https://github.com/CAPHTECH/higher-graphen.git", rev = "f78e0205558c284cbb98fc706ba1caf14f40908e" }
+higher-graphen-interpretation = { git = "https://github.com/CAPHTECH/higher-graphen.git", rev = "f78e0205558c284cbb98fc706ba1caf14f40908e" }
+
+# Internal crates
+specgraphen-model = { path = "crates/specgraphen-model" }
+specgraphen-lift = { path = "crates/specgraphen-lift" }
+specgraphen-llm = { path = "crates/specgraphen-llm" }
+specgraphen-corroboration = { path = "crates/specgraphen-corroboration" }
+specgraphen-invariant = { path = "crates/specgraphen-invariant" }
+specgraphen-query = { path = "crates/specgraphen-query" }
+specgraphen-store = { path = "crates/specgraphen-store" }
+specgraphen-mcp = { path = "crates/specgraphen-mcp" }
+specgraphen-resolver = { path = "crates/specgraphen-resolver" }
+
+# External
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"

@@ -1,0 +1,15 @@
+[package]
+name = "specgraphen-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TypeResolver trait with LSP and heuristic implementations"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+lsp-types = "0.97"

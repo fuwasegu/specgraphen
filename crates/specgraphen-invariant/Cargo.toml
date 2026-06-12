@@ -1,0 +1,14 @@
+[package]
+name = "specgraphen-invariant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Grounding, consistency, and reachability invariant checks"
+
+[dependencies]
+specgraphen-model.workspace = true
+higher-graphen-reasoning.workspace = true
+higher-graphen-structure.workspace = true
+higher-graphen-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

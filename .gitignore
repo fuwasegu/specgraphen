@@ -1,0 +1,10 @@
+/target
+.specgraphen/
+*.swp
+*.swo
+.DS_Store
+.env
+
+# Local tool configuration (contains machine-specific paths)
+.claude/
+.serena/

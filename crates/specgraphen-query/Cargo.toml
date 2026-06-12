@@ -1,0 +1,20 @@
+[package]
+name = "specgraphen-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Query engine: explain, callers, callees, and impact analysis"
+
+[dependencies]
+specgraphen-model.workspace = true
+specgraphen-store.workspace = true
+higher-graphen-structure.workspace = true
+higher-graphen-projection.workspace = true
+higher-graphen-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+specgraphen-lift.workspace = true

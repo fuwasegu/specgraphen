@@ -1,0 +1,21 @@
+[package]
+name = "specgraphen-corroboration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multi-derivation fusion and confidence calculation"
+
+[dependencies]
+specgraphen-model.workspace = true
+specgraphen-lift.workspace = true
+specgraphen-llm.workspace = true
+higher-graphen-core.workspace = true
+higher-graphen-evidence.workspace = true
+higher-graphen-reasoning.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+glob.workspace = true

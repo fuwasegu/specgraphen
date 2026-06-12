@@ -1,0 +1,21 @@
+[package]
+name = "specgraphen-lift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "tree-sitter based Java source lifting into Higher Graphen spaces"
+
+[dependencies]
+specgraphen-model.workspace = true
+higher-graphen-core.workspace = true
+higher-graphen-structure.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+glob.workspace = true
+tree-sitter = "0.24"
+tree-sitter-java = "0.23"
+encoding_rs = "0.8"

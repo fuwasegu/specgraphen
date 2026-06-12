@@ -1,0 +1,28 @@
+[package]
+name = "specgraphen-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface for specgraphen (lift / query / serve)"
+
+[[bin]]
+name = "specgraphen"
+path = "src/main.rs"
+
+[dependencies]
+specgraphen-model.workspace = true
+specgraphen-lift.workspace = true
+specgraphen-llm.workspace = true
+specgraphen-corroboration.workspace = true
+specgraphen-invariant.workspace = true
+specgraphen-query.workspace = true
+specgraphen-store.workspace = true
+specgraphen-mcp.workspace = true
+specgraphen-resolver.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+encoding_rs = "0.8"
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
