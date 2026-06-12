@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-cli"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-corroboration"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "glob",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-invariant"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "higher-graphen-core",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-lift"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-llm"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1382,11 +1382,11 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-logic"
-version = "1.2.0"
+version = "1.3.0"
 
 [[package]]
 name = "specgraphen-mcp"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-model"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "higher-graphen-core",
  "higher-graphen-interpretation",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-query"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "higher-graphen-core",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-resolver"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "specgraphen-store"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
