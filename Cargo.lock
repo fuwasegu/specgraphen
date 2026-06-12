@@ -1296,6 +1296,7 @@ dependencies = [
  "anyhow",
  "clap",
  "encoding_rs",
+ "glob",
  "serde_json",
  "specgraphen-corroboration",
  "specgraphen-invariant",

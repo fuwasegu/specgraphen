@@ -91,6 +91,73 @@ pub fn parse_field_declarations(source: &str) -> Vec<FieldDecl> {
     decls
 }
 
+/// Class-level JPA `@Table(name = "...")` annotation value, if present.
+pub fn table_annotation_name(source: &str) -> Option<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("@Table"))
+        .and_then(|l| quoted_arg(l, "name"))
+}
+
+/// Default SQL name for a Java identifier per the common JPA naming
+/// strategy: camelCase → snake_case.
+pub fn default_sql_name(identifier: &str) -> String {
+    let mut out = String::new();
+    for c in identifier.chars() {
+        if c.is_uppercase() {
+            if !out.is_empty() && !out.ends_with('_') {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// True if the method label looks like a JavaBeans accessor (getX/setX/isX).
+pub fn is_accessor(label: &str) -> bool {
+    ["get", "set", "is"].iter().any(|p| {
+        label
+            .strip_prefix(p)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_uppercase())
+    })
+}
+
+/// CRUD letters implied by a Spring-Data-style repository method name
+/// (`findById` → "R", `save` → "CU"), if the name follows the convention.
+pub fn repository_operation(method_name: &str) -> Option<&'static str> {
+    const RULES: &[(&[&str], &str)] = &[
+        (&["insert", "create", "persist", "register"], "C"),
+        (&["save", "store", "add"], "CU"),
+        (
+            &[
+                "find", "get", "select", "load", "read", "count", "exists", "list", "search",
+                "query", "fetch",
+            ],
+            "R",
+        ),
+        (&["update", "merge", "modify"], "U"),
+        (&["delete", "remove", "purge"], "D"),
+    ];
+    let lower = method_name.to_lowercase();
+    RULES
+        .iter()
+        .find(|(prefixes, _)| prefixes.iter().any(|p| lower.starts_with(p)))
+        .map(|(_, ops)| *ops)
+}
+
+/// Entity simple name implied by a data-access class name
+/// (`UserRepository` → `User`), if the name follows the convention.
+pub fn repository_entity_name(class_simple: &str) -> Option<&str> {
+    ["Repository", "Dao", "Mapper"]
+        .iter()
+        .find_map(|suffix| class_simple.strip_suffix(suffix).filter(|s| !s.is_empty()))
+}
+
 /// JavaBeans getter call patterns for a field, e.g. `.getEmail(` / `.isActive(`.
 pub fn getter_patterns(field_name: &str) -> Vec<String> {
     let cap = capitalize(field_name);
@@ -254,6 +321,16 @@ public class Customer {
         assert_eq!(decls[0].doc.as_deref(), Some("Customer mail address"));
         assert_eq!(decls[1].column_name, None);
         assert_eq!(decls[1].doc.as_deref(), Some("soft-delete flag"));
+    }
+
+    #[test]
+    fn maps_java_identifiers_to_sql_names() {
+        assert_eq!(default_sql_name("userName"), "user_name");
+        assert_eq!(default_sql_name("email"), "email");
+        assert_eq!(default_sql_name("OrderItem"), "order_item");
+
+        let source = "@Table(name = \"app_user\")\npublic class User {}";
+        assert_eq!(table_annotation_name(source).as_deref(), Some("app_user"));
     }
 
     #[test]

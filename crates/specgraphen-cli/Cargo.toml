@@ -22,6 +22,7 @@ specgraphen-resolver.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 encoding_rs = "0.8"
+glob.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

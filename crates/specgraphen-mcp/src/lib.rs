@@ -200,7 +200,7 @@ impl SpecGraphenServer {
                 },
                 {
                     "name": "column_usage",
-                    "description": "Analyze how each column (field) of a data/table class is used across the codebase. Returns: column name, logical name (from JPA @Column annotations and doc comments), data type, and all read/write sites with file:line. Use this to understand what each DB column is for and where it's accessed.",
+                    "description": "Analyze how each column (field) of a data/table class is used across the codebase. Returns: column name, logical name (from JPA @Column annotations, doc comments, or DDL COMMENT), data type, and all read/write sites with file:line — including references inside SQL statements and .sql files. Use this to understand what each DB column is for and where it's accessed.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -334,6 +334,47 @@ impl SpecGraphenServer {
                 {
                     "name": "save",
                     "description": "Persist all annotations to disk. Call this after a batch of `annotate` calls to save the enriched space data.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                },
+                {
+                    "name": "dead_code",
+                    "description": "Find unused methods and classes: entities with no callers or references in the analyzed sources. Each finding has a confidence level (high = private and unreferenced, medium = public but unreferenced, low = possibly framework-invoked) and a reason. Use this to identify deletion candidates in legacy code.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                },
+                {
+                    "name": "hotspots",
+                    "description": "Rank methods by approximate cyclomatic complexity and size. Use this to triage where to start reading or refactoring a legacy codebase.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "number",
+                                "description": "Max results (default 20)"
+                            }
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "crud_matrix",
+                    "description": "Build an entry-point × table CRUD matrix: which entry points create/read/update/delete which data classes, derived from SQL statements (Java strings, .sql files, MyBatis mapper XML) and repository naming conventions reached over the call graph. A classic legacy-analysis deliverable.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                },
+                {
+                    "name": "export_spec",
+                    "description": "Export a Markdown specification document built from the lifted structure and all accumulated semantic annotations (intent, behavior, contracts). Use after enriching the space to produce a human-readable spec for the legacy codebase.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -530,6 +571,35 @@ impl SpecGraphenServer {
                     .map_err(|e| (-32000, format!("Error: {e}")))?;
                 format!("{{\"status\": \"ok\", \"symbol\": \"{symbol}\"}}")
             }
+            "dead_code" => {
+                let result = self
+                    .query_engine
+                    .dead_code()
+                    .map_err(|e| (-32000, format!("Error: {e}")))?;
+                serde_json::to_string_pretty(&result)
+                    .map_err(|e| (-32000, format!("Serialization error: {e}")))?
+            }
+            "hotspots" => {
+                let limit = arguments["limit"].as_u64().unwrap_or(20) as usize;
+                let result = self
+                    .query_engine
+                    .hotspots(limit)
+                    .map_err(|e| (-32000, format!("Error: {e}")))?;
+                serde_json::to_string_pretty(&result)
+                    .map_err(|e| (-32000, format!("Serialization error: {e}")))?
+            }
+            "crud_matrix" => {
+                let result = self
+                    .query_engine
+                    .crud_matrix()
+                    .map_err(|e| (-32000, format!("Error: {e}")))?;
+                serde_json::to_string_pretty(&result)
+                    .map_err(|e| (-32000, format!("Serialization error: {e}")))?
+            }
+            "export_spec" => self
+                .query_engine
+                .spec_markdown()
+                .map_err(|e| (-32000, format!("Error: {e}")))?,
             "save" => {
                 let snapshot = self
                     .query_engine

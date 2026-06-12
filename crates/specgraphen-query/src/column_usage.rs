@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use specgraphen_model::SpaceData;
 
-use crate::java;
+use crate::{java, sql};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ColumnUsageResult {
@@ -61,6 +61,10 @@ pub fn column_usage(
 
     let column_defs = java::parse_field_declarations(&source);
 
+    // DDL definitions for the matching table, if any SQL sources are provided
+    let table_names = candidate_table_names(&source, class_fqn);
+    let ddl_columns = find_ddl_columns(source_files, &table_names);
+
     // Find all field entities for this class
     let fields: Vec<_> = space_data
         .entities
@@ -79,17 +83,27 @@ pub fn column_usage(
 
         let col_def = column_defs.iter().find(|d| d.field_name == field_name);
 
-        let logical_name = col_def.and_then(|d| d.doc.clone()).unwrap_or_default();
+        // SQL column name: JPA @Column wins, else the default naming strategy
         let column_name = col_def
             .and_then(|d| d.column_name.clone())
-            .unwrap_or_else(|| field_name.to_string());
+            .unwrap_or_else(|| java::default_sql_name(field_name));
+        let ddl_col = ddl_columns
+            .iter()
+            .find(|c| c.column_name.eq_ignore_ascii_case(&column_name));
+
+        let logical_name = col_def
+            .and_then(|d| d.doc.clone())
+            .or_else(|| ddl_col.and_then(|c| c.comment.clone()))
+            .unwrap_or_default();
         let data_type = col_def
             .map(|d| d.declared_type.clone())
+            .or_else(|| ddl_col.map(|c| c.sql_type.clone()))
             .unwrap_or_else(|| "unknown".to_string());
 
-        let (readers, writers) = find_field_usages(field_name, class_fqn, source_files);
+        let (readers, writers) =
+            find_field_usages(field_name, &column_name, class_fqn, source_files);
 
-        if !readers.is_empty() || !writers.is_empty() || col_def.is_some() {
+        if !readers.is_empty() || !writers.is_empty() || col_def.is_some() || ddl_col.is_some() {
             columns.push(ColumnInfo {
                 field_name: field_name.to_string(),
                 logical_name,
@@ -122,6 +136,7 @@ pub fn column_usage(
 
 fn find_field_usages(
     field_name: &str,
+    sql_column: &str,
     class_fqn: &str,
     source_files: &HashMap<String, String>,
 ) -> (Vec<UsageSite>, Vec<UsageSite>) {
@@ -139,6 +154,7 @@ fn find_field_usages(
         if file_path.ends_with(&class_file_hint) {
             continue;
         }
+        let sql_context = sql::is_sql_file(file_path);
 
         for (line_num, line) in content.lines().enumerate() {
             let line_num = line_num as u32 + 1;
@@ -147,12 +163,25 @@ fn find_field_usages(
             let has_getter = getters.iter().any(|g| line.contains(g.as_str()));
             let has_setter = line.contains(setter.as_str());
 
-            if !has_direct && !has_getter && !has_setter {
+            let sql_access = if !has_direct
+                && !has_getter
+                && !has_setter
+                && (sql_context || sql::looks_like_sql(line))
+            {
+                sql::column_access(line, sql_column)
+            } else {
+                None
+            };
+
+            if !has_direct && !has_getter && !has_setter && sql_access.is_none() {
                 continue;
             }
 
-            let is_write = has_setter || java::is_direct_field_write(line, field_name);
-            let is_read = has_getter || (has_direct && !is_write);
+            let is_write = has_setter
+                || java::is_direct_field_write(line, field_name)
+                || sql_access == Some(sql::SqlAccess::Write);
+            let is_read =
+                has_getter || (has_direct && !is_write) || sql_access == Some(sql::SqlAccess::Read);
 
             let inferred_class = infer_class_from_file(file_path);
 
@@ -184,6 +213,36 @@ fn find_field_usages(
     writers.dedup_by(|a, b| a.file == b.file && a.line == b.line);
 
     (readers, writers)
+}
+
+fn candidate_table_names(class_source: &str, class_fqn: &str) -> Vec<String> {
+    let class_simple = class_fqn.rsplit('.').next().unwrap_or(class_fqn);
+    let snake = java::default_sql_name(class_simple);
+
+    let mut names = Vec::new();
+    if let Some(name) = java::table_annotation_name(class_source) {
+        names.push(name.to_lowercase());
+    }
+    names.push(format!("{snake}s")); // naive plural convention
+    names.push(snake);
+    names
+}
+
+fn find_ddl_columns(
+    source_files: &HashMap<String, String>,
+    table_names: &[String],
+) -> Vec<sql::SqlColumnDef> {
+    for (file_path, content) in source_files {
+        if !sql::is_sql_file(file_path) {
+            continue;
+        }
+        for table in sql::parse_create_tables(content) {
+            if table_names.contains(&table.table_name.to_lowercase()) {
+                return table.columns;
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn infer_class_from_file(file_path: &str) -> String {

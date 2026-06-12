@@ -43,7 +43,157 @@ fn build_engine_with_sources() -> QueryEngine {
         source_files.insert(file.clone(), content);
     }
 
+    // SQL sources, as the CLI `serve` command loads them
+    for sql_file in ["db/schema.sql", "db/queries.sql"] {
+        let content =
+            std::fs::read_to_string(fixture_path.join(sql_file)).expect("Failed to read SQL file");
+        source_files.insert(sql_file.to_string(), content);
+    }
+
     QueryEngine::new(result.space_data).with_sources(source_files)
+}
+
+#[test]
+fn test_dead_code_finds_unreferenced_methods_and_classes() {
+    let engine = build_engine_with_sources();
+    let result = engine.dead_code().expect("dead_code failed");
+
+    assert!(
+        result
+            .unused_methods
+            .iter()
+            .any(|m| m.fqn.ends_with("NotificationService.sendWelcomeEmail")),
+        "sendWelcomeEmail has no callers and should be reported"
+    );
+    assert!(
+        !result
+            .unused_methods
+            .iter()
+            .any(|m| m.fqn.ends_with("UserService.getUser")),
+        "getUser is called by deleteUser and must not be reported"
+    );
+    assert!(
+        result
+            .unused_classes
+            .iter()
+            .any(|c| c.fqn.ends_with("NotificationService")),
+        "NotificationService is never referenced and should be reported"
+    );
+    assert!(
+        !result
+            .unused_classes
+            .iter()
+            .any(|c| c.fqn.ends_with(".User")),
+        "User is constructed by createUser and must not be reported"
+    );
+}
+
+#[test]
+fn test_hotspots_ranks_branchy_methods_first() {
+    let engine = build_engine_with_sources();
+    let result = engine.hotspots(5).expect("hotspots failed");
+
+    assert!(!result.hotspots.is_empty());
+    assert!(
+        result.hotspots[0].fqn.ends_with("UserService.createUser"),
+        "createUser has the most decision points, got {}",
+        result.hotspots[0].fqn
+    );
+    assert!(result.hotspots[0].complexity >= 4);
+    assert!(result.hotspots[0].loc > 0);
+}
+
+#[test]
+fn test_crud_matrix_from_repository_conventions() {
+    let engine = build_engine_with_sources();
+    let result = engine.crud_matrix().expect("crud_matrix failed");
+
+    let user = result
+        .tables
+        .iter()
+        .find(|t| t.table_class == "com.example.model.User")
+        .expect("User should be detected as a data class");
+    assert_eq!(user.table_name, "user");
+
+    let create = user
+        .entries
+        .iter()
+        .find(|e| e.entry_point.ends_with("createUser"))
+        .expect("createUser entry point should be present");
+    assert!(
+        create.operations.contains('C') && create.operations.contains('U'),
+        "repository.save() implies C and U, got {}",
+        create.operations
+    );
+
+    let delete = user
+        .entries
+        .iter()
+        .find(|e| e.entry_point.ends_with("deleteUser"))
+        .expect("deleteUser entry point should be present");
+    assert!(
+        delete.operations.contains('D'),
+        "repository.deleteById() implies D, got {}",
+        delete.operations
+    );
+    assert!(
+        delete.operations.contains('R'),
+        "deleteUser reaches getUser → findById, implying R, got {}",
+        delete.operations
+    );
+}
+
+#[test]
+fn test_spec_markdown_includes_annotations() {
+    let engine = build_engine_with_sources();
+    engine
+        .annotate_by_fqn(
+            "com.example.service.UserService.createUser",
+            specgraphen_model::SemanticAnnotation {
+                intent: Some("Create a user after validating name and email".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("annotate failed");
+
+    let markdown = engine.spec_markdown().expect("export failed");
+    assert!(markdown.contains("# Specification:"));
+    assert!(markdown.contains("### `UserService`"));
+    assert!(markdown.contains("Create a user after validating name and email"));
+    assert!(markdown.contains("_(not yet annotated)_"));
+}
+
+#[test]
+fn test_column_usage_sql_sources() {
+    let engine = build_engine_with_sources();
+    let result = engine.column_usage("User").expect("column_usage failed");
+
+    let email = result
+        .columns
+        .iter()
+        .find(|c| c.field_name == "email")
+        .expect("email column should be present");
+    assert_eq!(
+        email.logical_name, "Mail address",
+        "logical name should fall back to the DDL COMMENT"
+    );
+    assert!(
+        email
+            .writers
+            .iter()
+            .any(|w| w.file.ends_with("queries.sql") && w.access_type == "write"),
+        "UPDATE ... SET email should be detected as a write"
+    );
+
+    let id = result
+        .columns
+        .iter()
+        .find(|c| c.field_name == "id")
+        .expect("id column should be present");
+    assert!(
+        id.readers.iter().any(|r| r.file.ends_with("queries.sql")),
+        "WHERE id = ? should be detected as a read"
+    );
 }
 
 #[test]

@@ -13,5 +13,5 @@ pub use derivation::DerivationSource;
 pub use entity::JavaEntityType;
 pub use relation::JavaRelationType;
 pub use semantic::SemanticAnnotation;
-pub use space_data::SpaceData;
+pub use space_data::{EntityRecord, RelationRecord, SpaceData};
 pub use witness::WitnessInfo;

@@ -14,7 +14,7 @@ specgraphen solves this by:
 
 1. **Pre-analyzing** the entire codebase (tree-sitter + optional LSP) into a structured graph
 2. **Storing** entities, relations, and witnesses in a Higher Graphen Space
-3. **Serving** 15 query tools via MCP — one call per question, sub-second response
+3. **Serving** 19 query tools via MCP — one call per question, sub-second response
 
 | Without specgraphen | With specgraphen |
 |---|---|
@@ -73,7 +73,7 @@ Just ask naturally:
 - "What are the columns of the Customer table and where are they used?"
 - "Explain the createUser method"
 
-## 15 MCP Tools
+## 19 MCP Tools
 
 ### Project-wide
 
@@ -88,7 +88,7 @@ Just ask naturally:
 | Tool | What it returns |
 |---|---|
 | `feature` | Classes, entry points, internal calls, external deps for a business feature |
-| `column_usage` | Per-column logical name, data type, and all read/write sites |
+| `column_usage` | Per-column logical name, data type, and all read/write sites — in Java code and SQL statements (`.sql` files, DDL `COMMENT`) |
 
 ### Symbol-level
 
@@ -105,6 +105,15 @@ Just ask naturally:
 |---|---|
 | `impact` | Direct + transitive impacts of changing a symbol, affected files |
 | `unknowns` | Ambiguous points, unresolved references (known unknowns) |
+
+### Legacy analysis
+
+| Tool | What it returns |
+|---|---|
+| `dead_code` | Unused methods/classes with confidence levels (deletion candidates) |
+| `hotspots` | Methods ranked by approximate cyclomatic complexity (refactoring triage) |
+| `crud_matrix` | Entry-point × table CRUD matrix from SQL, mapper XML, and repository conventions |
+| `export_spec` | Markdown specification built from structure + accumulated annotations |
 
 ### Enrich flow (Claude Code as LLM)
 
@@ -140,8 +149,8 @@ Falls back to tree-sitter heuristics when LSP is unavailable.
 ## Architecture
 
 ```
-specgraphen-cli          CLI binary (lift / query / serve)
-specgraphen-mcp          MCP server (stdio JSON-RPC, 15 tools)
+specgraphen-cli          CLI binary (lift / query / serve / export)
+specgraphen-mcp          MCP server (stdio JSON-RPC, 19 tools)
 specgraphen-query         Query engine + projection
 specgraphen-lift          tree-sitter Java parser → HG Space
 specgraphen-resolver      TypeResolver trait (LSP / heuristic / chain)
@@ -178,7 +187,7 @@ specgraphen は:
 
 1. コードベース全体を事前解析（tree-sitter + オプションで LSP）して構造化グラフに変換
 2. エンティティ・関係・根拠を Higher Graphen Space に格納
-3. MCP 経由で 15 種類のクエリツールを提供 — 1回の問い合わせ、サブ秒で応答
+3. MCP 経由で 19 種類のクエリツールを提供 — 1回の問い合わせ、サブ秒で応答
 
 ## クイックスタート
 
@@ -246,7 +255,7 @@ LSP を使うと型厳密なシンボル解決が可能に:
 
 LSP が使えない環境では tree-sitter ヒューリスティックに自動フォールバック。
 
-## 15 の MCP ツール
+## 19 の MCP ツール
 
 | カテゴリ | ツール | 説明 |
 |---|---|---|
@@ -254,13 +263,17 @@ LSP が使えない環境では tree-sitter ヒューリスティックに自動
 | 全体 | `search` | 名前でエンティティ検索 |
 | 全体 | `package_dependencies` | パッケージ間依存グラフ |
 | 機能 | `feature` | 機能単位の分析（関連クラス、エントリポイント、依存） |
-| 機能 | `column_usage` | テーブルカラムの論理名・型・読み書き箇所 |
+| 機能 | `column_usage` | テーブルカラムの論理名・型・読み書き箇所（Java コードと SQL 文・DDL の両方から検出） |
 | シンボル | `explain` | シンボルの意味（signature, witness, callers, callees） |
 | シンボル | `callers` | 呼び出し元一覧 |
 | シンボル | `callees` | 呼び出し先一覧 |
 | シンボル | `class_dependencies` | クラスの依存関係 |
 | 変更 | `impact` | 変更影響範囲（直接 + 推移 + 影響ファイル） |
 | 変更 | `unknowns` | 曖昧点・未解決参照 |
+| レガシー | `dead_code` | 未使用メソッド/クラスの検出（確信度付き削除候補） |
+| レガシー | `hotspots` | 複雑度によるメソッドランキング（リファクタ優先度） |
+| レガシー | `crud_matrix` | エントリポイント × テーブルの CRUD マトリクス |
+| レガシー | `export_spec` | 構造 + 注釈から Markdown 仕様書を生成 |
 | 学習 | `enrich` | ソースコード + コンテキストを返す |
 | 学習 | `enrich_batch` | 未分析エンティティの一括取得 |
 | 学習 | `annotate` | Claude の分析結果を Space に書き戻す |

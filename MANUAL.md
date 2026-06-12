@@ -20,7 +20,7 @@ specgraphen は「事前に全ファイルを解析して構造化データを�
 
 ② serve（MCP サーバ起動）
    保存された Space を読み込み、MCP サーバとして待機
-   → Claude Code から 15 種類のクエリを受け付ける
+   → Claude Code から 19 種類のクエリを受け付ける
 
 ③ Claude Code が使う
    ユーザーが「注文機能の仕様を教えて」と聞く
@@ -72,11 +72,11 @@ Shift-JIS / EUC-JP のレガシー Java コードも自動判定して読める�
 
 **serve = lift で作った構造化データを MCP サーバとして公開する処理。**
 
-Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると、Claude Code 起動時に自動で specgraphen サーバが立ち上がる。以後、Claude Code は 15 種類のツールでコードの情報を取得できる。
+Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると、Claude Code 起動時に自動で specgraphen サーバが立ち上がる。以後、Claude Code は 19 種類のツールでコードの情報を取得できる。
 
 ---
 
-## 15 のツール一覧
+## 19 のツール一覧
 
 ### 全体を見る
 
@@ -91,7 +91,7 @@ Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると
 | ツール | 何がわかる | 使い方の例 |
 |---|---|---|
 | **feature** | キーワードで機能を分析。関連クラス、エントリポイント、内部呼び出し、外部依存 | 「注文機能の仕様を教えて」 |
-| **column_usage** | テーブルクラスの各カラムの論理名・データ型・読み書き箇所 | 「User テーブルの各カラムの用途は？」 |
+| **column_usage** | テーブルクラスの各カラムの論理名・データ型・読み書き箇所。JPA `@Column`/javadoc/DDL `COMMENT` から論理名を取得し、Java コードと SQL 文の両方から利用箇所を検出 | 「User テーブルの各カラムの用途は？」 |
 
 ### シンボルを調べる
 
@@ -108,6 +108,17 @@ Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると
 |---|---|---|
 | **impact** | シンボルを変更した場合の波及範囲（直接影響 + 推移影響 + 影響ファイル） | 「UserService を変えたら何に影響する？」 |
 | **unknowns** | 解析で曖昧だった箇所・未解決参照の一覧 | 「不明点を教えて」 |
+
+### レガシーコードを解析する
+
+| ツール | 何がわかる | 使い方の例 |
+|---|---|---|
+| **dead_code** | どこからも呼ばれていないメソッド/クラス。確信度（high/medium/low）と理由付き | 「消せるコードを探して」 |
+| **hotspots** | 複雑度（分岐数ベースの近似サイクロマティック複雑度）の高いメソッドランキング | 「どこからリファクタすべき？」 |
+| **crud_matrix** | エントリポイント × テーブルの CRUD マトリクス。SQL 文・MyBatis mapper XML・リポジトリ命名規約から導出 | 「どの処理がどのテーブルを更新してる？」 |
+| **export_spec** | 構造 + 蓄積した注釈から Markdown 仕様書を生成 | 「仕様書を出力して」 |
+
+`dead_code` と `crud_matrix` は静的解析の限界（リフレクション、DI、未解決参照）を確信度と note で明示する。`unknowns` と組み合わせて解析の抜けを確認できる。
 
 ### AI がコードの意味を学習する（enrich フロー）
 
@@ -179,6 +190,14 @@ claude
 
 Claude Code 内で自然言語で聞けば、specgraphen のツールが自動で呼ばれる。
 
+### 5. 仕様書を出力する（オプション）
+
+enrich フローで注釈を蓄積したあと、Markdown 仕様書として書き出せる:
+
+```sh
+specgraphen export --space-id myproject --store /path/to/.specgraphen --out SPEC.md
+```
+
 ---
 
 ## アーキテクチャ
@@ -195,7 +214,7 @@ Claude Code 内で自然言語で聞けば、specgraphen のツールが自動�
                            │
               ┌────────────▼────────────┐
               │     Query Engine        │
-              │  15 ツール + Projection  │
+              │  19 ツール + Projection  │
               └────────────┬────────────┘
                            │
          ┌─────────────────▼─────────────────┐
@@ -220,10 +239,10 @@ Claude Code 内で自然言語で聞けば、specgraphen のツールが自動�
 | `specgraphen-llm` | LLM 抽象化。Claude API / OpenAI 互換 |
 | `specgraphen-corroboration` | 多重導出コロボレーション。HG Bayesian Confidence + Correspondence + Gluing |
 | `specgraphen-invariant` | 構造検査。HG reachable() + find_simple_cycles() |
-| `specgraphen-query` | 15 ツールのクエリエンジン |
+| `specgraphen-query` | 19 ツールのクエリエンジン |
 | `specgraphen-store` | JSON ファイル永続化 |
 | `specgraphen-mcp` | MCP サーバ（stdio JSON-RPC） |
-| `specgraphen-cli` | CLI バイナリ（lift / query / serve） |
+| `specgraphen-cli` | CLI バイナリ（lift / query / serve / export） |
 
 ### Higher Graphen (HG) の活用
 

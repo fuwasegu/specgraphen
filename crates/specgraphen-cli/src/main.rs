@@ -57,6 +57,16 @@ enum Commands {
         #[arg(long)]
         source_root: Option<String>,
     },
+    /// Export a Markdown specification from the lifted space and its annotations
+    Export {
+        #[arg(long, default_value = ".specgraphen")]
+        store: String,
+        #[arg(long)]
+        space_id: String,
+        /// Output file (stdout if omitted)
+        #[arg(long)]
+        out: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,6 +246,36 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            // Load SQL and MyBatis mapper XML sources so column_usage and
+            // crud_matrix can see DDL, queries, and mapper statements
+            if let Some(ref root) = source_root_path {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                for ext in ["sql", "xml"] {
+                    let pattern = canonical
+                        .join(format!("**/*.{ext}"))
+                        .to_string_lossy()
+                        .to_string();
+                    let Ok(paths) = glob::glob(&pattern) else {
+                        continue;
+                    };
+                    for path in paths.flatten() {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            let content = if let Ok(s) = std::str::from_utf8(&bytes) {
+                                s.to_string()
+                            } else {
+                                let (decoded, _, _) = encoding_rs::SHIFT_JIS.decode(&bytes);
+                                decoded.into_owned()
+                            };
+                            // Only mapper XMLs are useful; skip other XML files
+                            if ext == "xml" && !content.contains("<mapper") {
+                                continue;
+                            }
+                            source_files.insert(path.to_string_lossy().to_string(), content);
+                        }
+                    }
+                }
+            }
+
             tracing::info!(
                 source_files = source_files.len(),
                 "Source files loaded for enrich"
@@ -247,6 +287,23 @@ async fn main() -> anyhow::Result<()> {
 
             tracing::info!(%transport, %space_id, "Starting MCP server");
             server.run_stdio().await?;
+        }
+        Commands::Export {
+            store,
+            space_id,
+            out,
+        } => {
+            let file_store = specgraphen_store::JsonFileStore::new(&store);
+            use specgraphen_store::SpaceStore;
+            let space_data = file_store.load(&space_id).await?;
+            let markdown = specgraphen_query::export::spec_markdown(&space_data)?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, &markdown)?;
+                    println!("Specification written to {path}");
+                }
+                None => print!("{markdown}"),
+            }
         }
     }
 

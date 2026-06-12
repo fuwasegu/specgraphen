@@ -2,16 +2,22 @@
 
 mod call_graph;
 mod column_usage;
+mod crud;
+mod dead_code;
 mod dependencies;
 pub mod enrich;
 mod explain;
+pub mod export;
 mod feature;
+mod hotspots;
 mod impact;
 mod java;
+mod mybatis;
 mod overview;
 pub mod projection;
 pub mod resolve;
 mod search;
+mod sql;
 pub mod types;
 mod unknowns;
 
@@ -22,9 +28,12 @@ use anyhow::Result;
 use specgraphen_model::{SemanticAnnotation, SpaceData};
 
 pub use column_usage::ColumnUsageResult;
+pub use crud::CrudMatrixResult;
+pub use dead_code::DeadCodeResult;
 pub use dependencies::DependencyResult;
 pub use enrich::{EnrichBatchRequest, EnrichRequest};
 pub use feature::FeatureResult;
+pub use hotspots::HotspotsResult;
 pub use impact::ImpactResult;
 pub use overview::OverviewResult;
 pub use search::SearchResult;
@@ -107,6 +116,26 @@ impl QueryEngine {
     pub fn column_usage(&self, table_class: &str) -> Result<ColumnUsageResult> {
         let data = self.space_data.read().unwrap();
         column_usage::column_usage(&data, table_class, &self.source_files)
+    }
+
+    pub fn dead_code(&self) -> Result<DeadCodeResult> {
+        let data = self.space_data.read().unwrap();
+        dead_code::dead_code(&data, &self.source_files)
+    }
+
+    pub fn hotspots(&self, limit: usize) -> Result<HotspotsResult> {
+        let data = self.space_data.read().unwrap();
+        hotspots::hotspots(&data, &self.source_files, limit)
+    }
+
+    pub fn crud_matrix(&self) -> Result<CrudMatrixResult> {
+        let data = self.space_data.read().unwrap();
+        crud::crud_matrix(&data, &self.source_files)
+    }
+
+    pub fn spec_markdown(&self) -> Result<String> {
+        let data = self.space_data.read().unwrap();
+        export::spec_markdown(&data)
     }
 
     pub fn enrich(&self, symbol: &str) -> Result<EnrichRequest> {

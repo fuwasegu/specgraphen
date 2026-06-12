@@ -28,6 +28,7 @@ cargo fmt --check
 cargo run -p specgraphen-cli -- lift --root ./tests/fixtures/simple-project --space-id test
 cargo run -p specgraphen-cli -- query explain com.example.UserService.createUser
 cargo run -p specgraphen-cli -- serve --transport stdio
+cargo run -p specgraphen-cli -- export --space-id test --out SPEC.md
 ```
 
 ## Architecture
