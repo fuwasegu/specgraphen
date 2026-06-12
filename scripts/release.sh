@@ -33,7 +33,8 @@ cargo check --quiet
 
 git add Cargo.toml Cargo.lock
 git commit -m "v$VERSION"
-git tag "v$VERSION"
+# -m is required: with tag.gpgSign=true a bare `git tag` needs an editor and dies
+git tag -m "v$VERSION" "v$VERSION"
 git push origin HEAD "v$VERSION"
 
 echo "Released v$VERSION — watch https://github.com/fuwasegu/specgraphen/actions"
