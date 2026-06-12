@@ -397,6 +397,11 @@ impl SpecGraphenServer {
                             "symbol": {
                                 "type": "string",
                                 "description": "Method or class FQN (partial suffix match supported, e.g. 'UserService.createUser' or 'UserService')"
+                            },
+                            "terminal_calls": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Method names that terminate the process like System.exit (e.g. a legacy error-exit helper); paths end at such calls instead of flowing to an unreachable return"
                             }
                         },
                         "required": ["symbol"]
@@ -648,7 +653,15 @@ impl SpecGraphenServer {
                 let symbol = arguments["symbol"]
                     .as_str()
                     .ok_or((-32602, "Missing symbol argument".to_string()))?;
-                self.extract_core_rules(symbol)?
+                let terminal_calls: Vec<String> = arguments["terminal_calls"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.extract_core_rules(symbol, terminal_calls)?
             }
             _ => return Err((-32602, format!("Unknown tool: {tool_name}"))),
         };
@@ -658,7 +671,11 @@ impl SpecGraphenServer {
         }))
     }
 
-    fn extract_core_rules(&self, symbol: &str) -> Result<String, (i32, String)> {
+    fn extract_core_rules(
+        &self,
+        symbol: &str,
+        terminal_calls: Vec<String>,
+    ) -> Result<String, (i32, String)> {
         let (fqn, file, _) = self
             .query_engine
             .witness_of(symbol)
@@ -673,7 +690,8 @@ impl SpecGraphenServer {
         ))?;
 
         let mut extractor = specgraphen_lift::DecisionExtractor::new()
-            .map_err(|e| (-32000, format!("Extractor init failed: {e}")))?;
+            .map_err(|e| (-32000, format!("Extractor init failed: {e}")))?
+            .with_terminal_calls(terminal_calls);
         let extraction = extractor
             .extract(source)
             .map_err(|e| (-32000, format!("Parse failed for {file}: {e}")))?;

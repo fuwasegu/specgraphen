@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "specgraphen",
+    version,
     about = "AI-operated code meaning extraction substrate"
 )]
 struct Cli {
@@ -77,6 +78,10 @@ enum Commands {
         /// Source file encoding (e.g. shift_jis; auto-detected if omitted)
         #[arg(long)]
         source_encoding: Option<String>,
+        /// Method name that terminates the process like System.exit
+        /// (repeatable, e.g. --terminal-call abortOnError)
+        #[arg(long)]
+        terminal_call: Vec<String>,
     },
     /// Export a Markdown specification from the lifted space and its annotations
     Export {
@@ -323,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
             root,
             method,
             source_encoding,
+            terminal_call,
         } => {
             let forced = source_encoding
                 .as_deref()
@@ -330,7 +336,8 @@ async fn main() -> anyhow::Result<()> {
                 .transpose()?;
 
             let pattern = format!("{}/**/*.java", root.trim_end_matches('/'));
-            let mut extractor = specgraphen_lift::DecisionExtractor::new()?;
+            let mut extractor =
+                specgraphen_lift::DecisionExtractor::new()?.with_terminal_calls(terminal_call);
             let mut reported = 0usize;
             let mut all_skipped: Vec<(String, String)> = Vec::new();
 

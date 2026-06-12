@@ -324,6 +324,22 @@ specgraphen serve \
   [--transport stdio]
 ```
 
+### rules
+
+メソッドの分岐ロジックを極小ディシジョンテーブルに圧縮して Markdown 出力（MCP ツール `extract_core_rules` の CLI 版）。
+
+```sh
+specgraphen rules \
+  --root <Java ソースのルート> \
+  [--method <FQN 断片>]            # 部分一致でメソッドを絞る
+  [--source-encoding shift_jis]    # 文字コード（省略時は自動判定）
+  [--terminal-call <メソッド名>]    # System.exit 同様にプロセス終了する
+                                   # ヘルパー（複数指定可）。該当呼び出しで
+                                   # パスを打ち切り、到達しない return を表示しない
+```
+
+if/else に加えて、各 case が break/return/throw で終わる「クリーンな switch」も else-if 連鎖としてモデル化する（fall-through や条件付き break を含む switch は incomplete 扱い）。代入・メソッド呼び出しは観測効果として outcome に反映され、ログ系呼び出し（`logger.*` 等）は意図的に無効果扱い。
+
 ---
 
 ## FAQ

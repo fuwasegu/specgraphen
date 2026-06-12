@@ -15,12 +15,18 @@
 //! mutation therefore form distinct outcome classes — without this,
 //! assignment-driven methods would report their conditions as falsely dead.
 //!
+//! Clean `switch` statements (every group ending in break/return/throw, or
+//! arrow rules) are modeled with else-if-chain semantics: entering case k
+//! pins all earlier case values to false, so mutually exclusive cases never
+//! produce infeasible don't-cares. Configurable terminal calls
+//! (`System.exit` built in) end a path where they occur.
+//!
 //! Honesty over coverage: constructs this walker does not model (loops,
-//! `switch`, `try`, …) mark the method [`MethodDecision::incomplete`] when
-//! they can terminate the method (contain `return`/`throw`), methods
-//! exceeding the atom/path caps are skipped with a reason instead of
-//! producing a partial table, and side effects of method calls
-//! (`list.add(...)` …) remain unmodeled.
+//! `try`, fall-through/conditional-break `switch`, …) mark the method
+//! [`MethodDecision::incomplete`] when they can terminate the method
+//! (contain `return`/`throw`), methods exceeding the atom/path caps are
+//! skipped with a reason instead of producing a partial table, and side
+//! effects of method calls (`list.add(...)` …) remain unmodeled.
 
 use specgraphen_logic::{DecisionTable, Tri};
 
@@ -61,13 +67,28 @@ pub struct DecisionExtraction {
 
 pub struct DecisionExtractor {
     parser: tree_sitter::Parser,
+    /// Callee names that never return (`System.exit` is built in); a path
+    /// reaching one terminates there instead of flowing to an unreachable
+    /// `return`. Entries match the callee (`abortOnError`) or its dotted
+    /// form (`Util.abort`).
+    terminal_calls: Vec<String>,
 }
 
 impl DecisionExtractor {
     pub fn new() -> anyhow::Result<Self> {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
-        Ok(Self { parser })
+        Ok(Self {
+            parser,
+            terminal_calls: vec!["System.exit".to_string()],
+        })
+    }
+
+    /// Register additional process-terminating helpers (legacy codebases
+    /// often wrap `System.exit` in their own error-exit methods).
+    pub fn with_terminal_calls(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.terminal_calls.extend(names);
+        self
     }
 
     /// Extract decision tables for every branching method in `source`.
@@ -86,6 +107,7 @@ impl DecisionExtractor {
             source.as_bytes(),
             &package,
             &mut class_stack,
+            &self.terminal_calls,
             &mut result,
         );
         Ok(result)
@@ -112,6 +134,7 @@ fn visit(
     src: &[u8],
     package: &Option<String>,
     class_stack: &mut Vec<String>,
+    terminal_calls: &[String],
     result: &mut DecisionExtraction,
 ) {
     match node.kind() {
@@ -126,18 +149,18 @@ fn visit(
             class_stack.push(name);
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit(child, src, package, class_stack, result);
+                visit(child, src, package, class_stack, terminal_calls, result);
             }
             class_stack.pop();
         }
         "method_declaration" | "constructor_declaration" => {
-            extract_method(node, src, package, class_stack, result);
+            extract_method(node, src, package, class_stack, terminal_calls, result);
             // nested local classes inside method bodies are rare; skip
         }
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit(child, src, package, class_stack, result);
+                visit(child, src, package, class_stack, terminal_calls, result);
             }
         }
     }
@@ -148,6 +171,7 @@ fn extract_method(
     src: &[u8],
     package: &Option<String>,
     class_stack: &[String],
+    terminal_calls: &[String],
     result: &mut DecisionExtraction,
 ) {
     let method_name = node
@@ -176,6 +200,7 @@ fn extract_method(
         src,
         atoms: Vec::new(),
         locals: parameter_names(node, src),
+        terminal_calls,
         paths: Vec::new(),
         incomplete: false,
     };
@@ -276,6 +301,8 @@ struct Walker<'a> {
     /// Names that cannot escape the method (parameters and declared locals);
     /// writes to them are invisible in outcomes unless returned.
     locals: std::collections::HashSet<String>,
+    /// Callee names that terminate the process — a path ends there.
+    terminal_calls: &'a [String],
     paths: Vec<(State, String)>,
     incomplete: bool,
 }
@@ -343,6 +370,13 @@ impl Walker<'_> {
             "expression_statement" => {
                 let mut state = state;
                 if let Some(expr) = named_children(stmt).first() {
+                    if expr.kind() == "method_invocation" && self.is_terminal_call(*expr) {
+                        // Process-terminating call: the path ends here; any
+                        // code after it is unreachable on this path.
+                        let call = normalize(&text(*expr, self.src));
+                        self.paths.push((state, call));
+                        return Ok(Vec::new());
+                    }
                     self.record_write(*expr, &mut state);
                 }
                 self.walk(stmts, idx + 1, state)
@@ -378,14 +412,31 @@ impl Walker<'_> {
                 }
                 Ok(fallthroughs)
             }
+            "switch_expression" | "switch_statement" => {
+                match self.model_switch(stmt, &state)? {
+                    Some(exits) => {
+                        let mut fallthroughs = Vec::new();
+                        for end in exits {
+                            fallthroughs.extend(self.walk(stmts, idx + 1, end)?);
+                        }
+                        Ok(fallthroughs)
+                    }
+                    // Unmodelable (fall-through / conditional break): same
+                    // honesty rule as loops — don't fabricate outcomes.
+                    None => {
+                        if contains_exit(stmt) {
+                            self.incomplete = true;
+                        }
+                        self.walk(stmts, idx + 1, state)
+                    }
+                }
+            }
             // Constructs we do not model: if they can terminate the method,
             // the table is incomplete (we'd otherwise fabricate outcomes).
             "while_statement"
             | "for_statement"
             | "enhanced_for_statement"
             | "do_statement"
-            | "switch_expression"
-            | "switch_statement"
             | "try_statement"
             | "try_with_resources_statement"
             | "synchronized_statement"
@@ -397,6 +448,21 @@ impl Walker<'_> {
             }
             _ => self.walk(stmts, idx + 1, state),
         }
+    }
+
+    /// Does this invocation match a configured process-terminating callee?
+    /// Matches the bare name (`abortOnError`) or `receiver.name` (`System.exit`).
+    fn is_terminal_call(&self, invocation: tree_sitter::Node) -> bool {
+        let Some(name) = invocation.child_by_field_name("name") else {
+            return false;
+        };
+        let name = text(name, self.src);
+        let dotted = invocation
+            .child_by_field_name("object")
+            .map(|o| format!("{}.{}", text(o, self.src), name));
+        self.terminal_calls
+            .iter()
+            .any(|t| *t == name || Some(t.as_str()) == dotted.as_deref())
     }
 
     /// Record an assignment / increment as a symbolic write. Anything else
@@ -516,6 +582,19 @@ impl Walker<'_> {
         Ok(results)
     }
 
+    fn atom_id(&mut self, label: String) -> Result<usize, String> {
+        match self.atoms.iter().position(|a| a == &label) {
+            Some(id) => Ok(id),
+            None => {
+                if self.atoms.len() >= MAX_ATOMS {
+                    return Err(format!("more than {MAX_ATOMS} distinct conditions"));
+                }
+                self.atoms.push(label);
+                Ok(self.atoms.len() - 1)
+            }
+        }
+    }
+
     /// Treat `node` as an atomic condition: same normalized text, same variable.
     /// A path that already assigned this atom follows that value (feasibility).
     fn atom(
@@ -524,16 +603,7 @@ impl Walker<'_> {
         state: State,
     ) -> Result<Vec<(State, bool)>, String> {
         let label = normalize(&text(node, self.src));
-        let id = match self.atoms.iter().position(|a| a == &label) {
-            Some(id) => id,
-            None => {
-                if self.atoms.len() >= MAX_ATOMS {
-                    return Err(format!("more than {MAX_ATOMS} distinct conditions"));
-                }
-                self.atoms.push(label);
-                self.atoms.len() - 1
-            }
-        };
+        let id = self.atom_id(label)?;
 
         if let Some(&(_, value)) = state.conds.iter().find(|(a, _)| *a == id) {
             return Ok(vec![(state, value)]);
@@ -544,6 +614,175 @@ impl Walker<'_> {
         let mut false_state = state;
         false_state.conds.push((id, false));
         Ok(vec![(true_state, true), (false_state, false)])
+    }
+
+    /// Try to assign `label = value` on a path. Returns false when the path
+    /// already pinned the atom to the opposite value (infeasible fork).
+    fn assign_atom(
+        &mut self,
+        label: String,
+        value: bool,
+        state: &mut State,
+    ) -> Result<bool, String> {
+        let id = self.atom_id(label)?;
+        if let Some(&(_, existing)) = state.conds.iter().find(|(a, _)| *a == id) {
+            return Ok(existing == value);
+        }
+        state.conds.push((id, value));
+        Ok(true)
+    }
+
+    /// Model a clean `switch` with else-if-chain semantics: entering case k
+    /// means every earlier case value compared false and case k compared
+    /// true. Sequential atoms keep mutually exclusive cases feasible-only.
+    ///
+    /// Returns `None` when the switch cannot be modeled faithfully
+    /// (fall-through between groups, or a conditional `break`).
+    fn model_switch(
+        &mut self,
+        node: tree_sitter::Node,
+        state: &State,
+    ) -> Result<Option<Vec<State>>, String> {
+        let Some(cond) = node.child_by_field_name("condition") else {
+            return Ok(None);
+        };
+        let subject = normalize(text(cond, self.src).trim_matches(['(', ')']));
+        let Some(body) = node.child_by_field_name("body") else {
+            return Ok(None);
+        };
+
+        // Phase 1: collect raw groups (case values — empty = default,
+        // statements including any trailing break, arrow-style flag).
+        struct RawGroup<'t> {
+            values: Vec<String>,
+            is_default: bool,
+            stmts: Vec<tree_sitter::Node<'t>>,
+            is_rule: bool,
+        }
+        let mut raw: Vec<RawGroup> = Vec::new();
+        for child in named_children(body) {
+            match child.kind() {
+                "switch_block_statement_group" | "switch_rule" => {
+                    let mut group = RawGroup {
+                        values: Vec::new(),
+                        is_default: false,
+                        stmts: Vec::new(),
+                        is_rule: child.kind() == "switch_rule",
+                    };
+                    for part in named_children(child) {
+                        if part.kind() == "switch_label" {
+                            let exprs = named_children(part);
+                            if exprs.is_empty() {
+                                group.is_default = true; // `default:`
+                            }
+                            for e in exprs {
+                                group.values.push(normalize(&text(e, self.src)));
+                            }
+                        } else {
+                            group.stmts.push(part);
+                        }
+                    }
+                    if group.values.is_empty() && !group.is_default {
+                        return Ok(None); // unexpected shape
+                    }
+                    raw.push(group);
+                }
+                _ => {}
+            }
+        }
+        if raw.is_empty() {
+            return Ok(None);
+        }
+
+        // Phase 2: stacked labels (`case 1:` with no statements falling into
+        // the next labeled group) — fold their values into that group.
+        let mut merged: Vec<RawGroup> = Vec::new();
+        let mut pending_values: Vec<String> = Vec::new();
+        let mut pending_default = false;
+        let last_index = raw.len() - 1;
+        for (i, mut group) in raw.into_iter().enumerate() {
+            if !group.is_rule && group.stmts.is_empty() && i != last_index {
+                pending_values.append(&mut group.values);
+                pending_default |= group.is_default;
+                continue;
+            }
+            group.values = pending_values.drain(..).chain(group.values).collect();
+            group.is_default |= std::mem::take(&mut pending_default);
+            merged.push(group);
+        }
+
+        // Phase 3: faithfulness check per executable group + strip breaks.
+        let mut groups: Vec<(Vec<String>, bool, Vec<tree_sitter::Node>)> = Vec::new();
+        let merged_len = merged.len();
+        for (i, mut group) in merged.into_iter().enumerate() {
+            if !group.is_rule {
+                let breaks = count_breaks(&group.stmts);
+                let ends_with_break = group
+                    .stmts
+                    .last()
+                    .is_some_and(|s| s.kind() == "break_statement");
+                if breaks > 1 || (breaks == 1 && !ends_with_break) {
+                    return Ok(None); // conditional break
+                }
+                if ends_with_break {
+                    group.stmts.pop();
+                } else {
+                    let exits_always = group.stmts.last().is_some_and(|s| {
+                        s.kind() == "return_statement" || s.kind() == "throw_statement"
+                    });
+                    // fall-through to the END of the switch is fine;
+                    // fall-through into the next group is not modeled
+                    if !exits_always && i + 1 != merged_len {
+                        return Ok(None);
+                    }
+                }
+            }
+            groups.push((group.values, group.is_default, group.stmts));
+        }
+
+        let mut exits = Vec::new();
+        let default_group: Option<usize> = groups.iter().position(|(_, is_default, _)| *is_default);
+
+        // One fork per case value: earlier values false, this value true.
+        let mut seen: Vec<String> = Vec::new();
+        for (values, _, stmts) in groups.clone() {
+            for value in values {
+                let label = format!("{subject} == {value}");
+                let mut branch = state.clone();
+                let mut feasible = true;
+                for earlier in &seen {
+                    if !self.assign_atom(format!("{subject} == {earlier}"), false, &mut branch)? {
+                        feasible = false;
+                        break;
+                    }
+                }
+                if feasible && self.assign_atom(label, true, &mut branch)? {
+                    exits.extend(self.walk(&stmts, 0, branch)?);
+                }
+                seen.push(value);
+            }
+        }
+
+        // The all-values-false fork: default group if present, else skip over.
+        let mut fallback = state.clone();
+        let mut feasible = true;
+        for value in &seen {
+            if !self.assign_atom(format!("{subject} == {value}"), false, &mut fallback)? {
+                feasible = false;
+                break;
+            }
+        }
+        if feasible {
+            match default_group {
+                Some(gi) => {
+                    let (_, _, stmts) = groups[gi].clone();
+                    exits.extend(self.walk(&stmts, 0, fallback)?);
+                }
+                None => exits.push(fallback),
+            }
+        }
+
+        Ok(Some(exits))
     }
 }
 
@@ -561,6 +800,28 @@ const LOGGING_PREFIXES: &[&str] = &[
 
 fn is_logging_call(call: &str) -> bool {
     LOGGING_PREFIXES.iter().any(|p| call.starts_with(p))
+}
+
+/// Count `break` statements binding to the enclosing switch (not descending
+/// into nested switches/loops, whose breaks bind there).
+fn count_breaks(stmts: &[tree_sitter::Node]) -> usize {
+    fn count(node: tree_sitter::Node) -> usize {
+        match node.kind() {
+            "break_statement" => 1,
+            "switch_expression"
+            | "switch_statement"
+            | "while_statement"
+            | "for_statement"
+            | "enhanced_for_statement"
+            | "do_statement" => 0,
+            _ => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.children(&mut cursor).collect();
+                children.into_iter().map(count).sum()
+            }
+        }
+    }
+    stmts.iter().map(|&s| count(s)).sum()
 }
 
 fn parameter_names(method: tree_sitter::Node, src: &[u8]) -> std::collections::HashSet<String> {
@@ -958,6 +1219,249 @@ mod tests {
                 .rows()
                 .iter()
                 .any(|r| r.outcome.contains("abortOnError()")),
+            "{:?}",
+            m.table.rows()
+        );
+    }
+
+    #[test]
+    fn clean_switch_models_as_sequential_cases() {
+        let m = single(
+            r#"
+            class A {
+                String m(String code) {
+                    switch (code) {
+                        case "A": return "alpha";
+                        case "B": return "beta";
+                        default: return "other";
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(!m.incomplete);
+        assert_eq!(m.table.variables(), ["code == \"A\"", "code == \"B\""]);
+        assert_eq!(m.table.rows().len(), 3);
+        let beta = m
+            .table
+            .rows()
+            .iter()
+            .find(|r| r.outcome == "return \"beta\"")
+            .unwrap();
+        // sequential semantics: case "B" implies case "A" compared false
+        assert_eq!(beta.inputs, vec![Tri::False, Tri::True]);
+        let c = compress(&m.table).unwrap();
+        assert!(c.dead_variables.is_empty());
+    }
+
+    #[test]
+    fn switch_with_breaks_and_assignments() {
+        let m = single(
+            r#"
+            class A {
+                int m(int code) {
+                    int r = 0;
+                    switch (code) {
+                        case 1:
+                            r = 10;
+                            break;
+                        case 2:
+                            r = 20;
+                            break;
+                        default:
+                            r = -1;
+                            break;
+                    }
+                    return r;
+                }
+            }
+            "#,
+        );
+        assert!(!m.incomplete);
+        let outcomes: std::collections::HashSet<_> =
+            m.table.rows().iter().map(|r| r.outcome.clone()).collect();
+        assert!(outcomes.contains("return 10"), "{outcomes:?}");
+        assert!(outcomes.contains("return 20"), "{outcomes:?}");
+        assert!(outcomes.contains("return -1"), "{outcomes:?}");
+    }
+
+    #[test]
+    fn stacked_case_labels_share_a_body() {
+        let m = single(
+            r#"
+            class A {
+                String m(int x) {
+                    switch (x) {
+                        case 1:
+                        case 2:
+                            return "low";
+                        default:
+                            return "high";
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(!m.incomplete);
+        let low: Vec<_> = m
+            .table
+            .rows()
+            .iter()
+            .filter(|r| r.outcome == "return \"low\"")
+            .collect();
+        assert_eq!(low.len(), 2, "{:?}", m.table.rows());
+    }
+
+    #[test]
+    fn switch_without_default_can_skip_through() {
+        let m = single(
+            r#"
+            class A {
+                String m(int x) {
+                    switch (x) {
+                        case 1: return "one";
+                    }
+                    return "other";
+                }
+            }
+            "#,
+        );
+        assert!(!m.incomplete);
+        let outcomes: Vec<_> = m.table.rows().iter().map(|r| r.outcome.as_str()).collect();
+        assert!(outcomes.contains(&"return \"one\""), "{outcomes:?}");
+        assert!(outcomes.contains(&"return \"other\""), "{outcomes:?}");
+    }
+
+    #[test]
+    fn fall_through_switch_is_not_modeled() {
+        // case 1 falls into case 2 (no break) — faithful modeling is not
+        // possible, so the old behavior applies: incomplete, no fabrication.
+        let m = single(
+            r#"
+            class A {
+                String m(int x, boolean c) {
+                    if (c) { return "early"; }
+                    switch (x) {
+                        case 1:
+                            doOne();
+                        case 2:
+                            doTwo();
+                            return "fell";
+                        default:
+                            return "other";
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(m.incomplete);
+        // switch atoms must not appear
+        assert_eq!(m.table.variables(), ["c"]);
+    }
+
+    #[test]
+    fn conditional_break_switch_is_not_modeled() {
+        let m = single(
+            r#"
+            class A {
+                int m(int x, boolean c) {
+                    int r = 0;
+                    if (c) { r = 1; }
+                    switch (x) {
+                        case 1:
+                            if (r == 1) break;
+                            return 99;
+                        default:
+                            break;
+                    }
+                    return r;
+                }
+            }
+            "#,
+        );
+        assert!(m.incomplete);
+    }
+
+    #[test]
+    fn arrow_switch_is_clean_by_construction() {
+        let m = single(
+            r#"
+            class A {
+                String m(int x) {
+                    switch (x) {
+                        case 1 -> { return "one"; }
+                        default -> { return "other"; }
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(!m.incomplete);
+        assert_eq!(m.table.rows().len(), 2);
+    }
+
+    #[test]
+    fn system_exit_terminates_the_path() {
+        let m = single(
+            r#"
+            class A {
+                String m(boolean c) {
+                    if (c) { System.exit(1); }
+                    return "ok";
+                }
+            }
+            "#,
+        );
+        let outcomes: Vec<_> = m.table.rows().iter().map(|r| r.outcome.as_str()).collect();
+        assert!(outcomes.contains(&"System.exit(1)"), "{outcomes:?}");
+        // the exiting path must NOT also show the unreachable return
+        assert!(
+            !outcomes
+                .iter()
+                .any(|o| o.contains("exit") && o.contains("ok")),
+            "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn configured_terminal_call_terminates_the_path() {
+        let java = r#"
+            class A {
+                String m(boolean c) {
+                    if (c) { abortOnError(); }
+                    return "ok";
+                }
+            }
+        "#;
+        let mut e = DecisionExtractor::new()
+            .unwrap()
+            .with_terminal_calls(vec!["abortOnError".to_string()]);
+        let mut x = e.extract(java).unwrap();
+        let m = x.methods.remove(0);
+        let outcomes: Vec<_> = m.table.rows().iter().map(|r| r.outcome.as_str()).collect();
+        assert!(outcomes.contains(&"abortOnError()"), "{outcomes:?}");
+        assert!(outcomes.contains(&"return \"ok\""), "{outcomes:?}");
+    }
+
+    #[test]
+    fn unconfigured_helper_call_does_not_terminate() {
+        // Without configuration the same call is just an effect; the path
+        // continues to the return (the pre-2b behavior, still the default).
+        let m = single(
+            r#"
+            class A {
+                String m(boolean c) {
+                    if (c) { abortOnError(); }
+                    return "ok";
+                }
+            }
+            "#,
+        );
+        assert!(
+            m.table
+                .rows()
+                .iter()
+                .any(|r| r.outcome.contains("abortOnError()") && r.outcome.contains("ok")),
             "{:?}",
             m.table.rows()
         );
