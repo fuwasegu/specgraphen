@@ -66,6 +66,18 @@ enum Commands {
         #[arg(long)]
         source_root: Option<String>,
     },
+    /// Extract compressed decision tables (core rules) from Java methods
+    Rules {
+        /// Root directory of Java source code
+        #[arg(long)]
+        root: String,
+        /// Only report methods whose FQN contains this substring
+        #[arg(long)]
+        method: Option<String>,
+        /// Source file encoding (e.g. shift_jis; auto-detected if omitted)
+        #[arg(long)]
+        source_encoding: Option<String>,
+    },
     /// Export a Markdown specification from the lifted space and its annotations
     Export {
         #[arg(long, default_value = ".specgraphen")]
@@ -306,6 +318,77 @@ async fn main() -> anyhow::Result<()> {
 
             tracing::info!(%transport, %space_id, "Starting MCP server");
             server.run_stdio().await?;
+        }
+        Commands::Rules {
+            root,
+            method,
+            source_encoding,
+        } => {
+            let forced = source_encoding
+                .as_deref()
+                .map(specgraphen_resolver::encoding::resolve_encoding)
+                .transpose()?;
+
+            let pattern = format!("{}/**/*.java", root.trim_end_matches('/'));
+            let mut extractor = specgraphen_lift::DecisionExtractor::new()?;
+            let mut reported = 0usize;
+            let mut all_skipped: Vec<(String, String)> = Vec::new();
+
+            for entry in glob::glob(&pattern)?.flatten() {
+                let source = match specgraphen_resolver::encoding::read_source(&entry, forced) {
+                    Ok(decoded) => decoded.text,
+                    Err(e) => {
+                        tracing::warn!(file = %entry.display(), "skipping unreadable file: {e}");
+                        continue;
+                    }
+                };
+                let extraction = match extractor.extract(&source) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::warn!(file = %entry.display(), "parse failed: {e}");
+                        continue;
+                    }
+                };
+                all_skipped.extend(extraction.skipped);
+
+                for decision in extraction.methods {
+                    let fqn = decision.fqn();
+                    if let Some(filter) = &method {
+                        if !fqn.contains(filter.as_str()) {
+                            continue;
+                        }
+                    }
+                    match specgraphen_logic::compress(&decision.table) {
+                        Ok(compressed) => {
+                            reported += 1;
+                            println!("## {fqn} ({}:{})", entry.display(), decision.start_line);
+                            if decision.incomplete {
+                                println!(
+                                    "\n> ⚠ incomplete: body contains unmodeled exits \
+                                     (loop/switch/try)"
+                                );
+                            }
+                            println!("\n{}", compressed.to_markdown());
+                        }
+                        Err(e) => {
+                            // A conflict here is itself a finding about the code
+                            println!("## {fqn} ({}:{})", entry.display(), decision.start_line);
+                            println!("\n> ✗ not compressible: {e}\n");
+                        }
+                    }
+                }
+            }
+
+            if !all_skipped.is_empty() {
+                println!("---");
+                println!("Skipped methods:");
+                for (fqn, reason) in &all_skipped {
+                    println!("- {fqn}: {reason}");
+                }
+            }
+            if reported == 0 {
+                println!("(no branching methods matched)");
+            }
         }
         Commands::Export {
             store,

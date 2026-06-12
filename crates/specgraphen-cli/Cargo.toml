@@ -20,6 +20,7 @@ specgraphen-query.workspace = true
 specgraphen-store.workspace = true
 specgraphen-mcp.workspace = true
 specgraphen-resolver.workspace = true
+specgraphen-logic.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 encoding_rs = "0.8"

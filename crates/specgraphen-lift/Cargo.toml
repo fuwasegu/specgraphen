@@ -8,6 +8,7 @@ description = "tree-sitter based Java source lifting into Higher Graphen spaces"
 
 [dependencies]
 specgraphen-model.workspace = true
+specgraphen-logic.workspace = true
 higher-graphen-core.workspace = true
 higher-graphen-structure.workspace = true
 serde.workspace = true
