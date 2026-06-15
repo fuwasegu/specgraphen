@@ -777,6 +777,14 @@ impl SpecGraphenServer {
             ));
         }
 
+        if result.incomplete {
+            out.push_str(
+                "\n> ⚠ incomplete: this path stepped over an unmodeled construct \
+                 (switch/try) that can itself return/throw — the outcome below may \
+                 not be the method's real behavior on this path.\n",
+            );
+        }
+
         out.push_str("\n## Status\n");
         match result.status {
             specgraphen_lift::TraceStatus::AwaitingChoice { branches } => {

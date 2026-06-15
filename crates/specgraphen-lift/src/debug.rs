@@ -44,6 +44,10 @@ pub struct TraceResult {
     /// Call-stack frame labels, outermost first.
     pub call_stack: Vec<String>,
     pub status: TraceStatus,
+    /// True if this path stepped over an unmodeled construct that can itself
+    /// exit the method (a `switch`/`try` with a return/throw inside) — the
+    /// reported outcome may then not be the method's real behavior.
+    pub incomplete: bool,
 }
 
 /// Replay `choices` through the method whose declaration starts at `start_line`
@@ -128,6 +132,7 @@ pub fn trace(
         context_rules: stepper.context_rules(),
         call_stack: stepper.call_stack().iter().map(|s| s.to_string()).collect(),
         status,
+        incomplete: stepper.is_incomplete(),
     })
 }
 

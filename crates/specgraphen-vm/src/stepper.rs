@@ -10,11 +10,14 @@
 //! execution state is plain data that can be snapshotted, serialized to a GUI,
 //! or driven from an MCP tool.
 //!
-//! Scope (v1): models `if`/`else`, blocks, sequential statements, assignments,
-//! and terminal calls. `switch`, loops, and `try` are stepped over as opaque
-//! statements (their effects are not modeled) and flagged via [`Stop::opaque`].
-//! Method calls are recorded as effects, not descended into (no cross-method
-//! step-into yet).
+//! Scope: models `if`/`else`, blocks, sequential statements, assignments, and
+//! terminal calls. Loops are presented as a choice — enter the body for one
+//! symbolic iteration, or skip it (zero iterations); both are sound world-lines
+//! (N>1 iterations are not enumerated). `switch` and `try` are still stepped
+//! over as opaque statements (flagged via [`Stop::opaque`]); if such a skipped
+//! construct can itself return/throw, the path is marked [`Stepper::is_incomplete`]
+//! so its reported outcome isn't trusted. Method calls are recorded as effects,
+//! not descended into (no cross-method step-into yet).
 
 use crate::sym::{self, AtomTable, Evaluator, SymError, SymState};
 
@@ -93,6 +96,7 @@ struct Snapshot<'a> {
     state: SymState,
     atoms: AtomTable,
     finished: Option<String>,
+    incomplete: bool,
 }
 
 pub struct Stepper<'a> {
@@ -104,6 +108,10 @@ pub struct Stepper<'a> {
     finished: Option<String>,
     pending: Vec<Pending<'a>>,
     history: Vec<Snapshot<'a>>,
+    /// True once this path stepped over an unmodeled construct that can itself
+    /// terminate the method (a `switch`/`try` containing return/throw): the
+    /// reported outcome is then not trustworthy as the method's behavior.
+    incomplete: bool,
 }
 
 impl<'a> Stepper<'a> {
@@ -127,7 +135,15 @@ impl<'a> Stepper<'a> {
             finished: None,
             pending: Vec::new(),
             history: Vec::new(),
+            incomplete: false,
         }
+    }
+
+    /// True if this path stepped over a construct that could itself exit the
+    /// method (an unmodeled `switch`/`try` with a return/throw inside), so a
+    /// reported terminal outcome may not be the real one.
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 
     pub fn state(&self) -> &SymState {
@@ -179,6 +195,7 @@ impl<'a> Stepper<'a> {
             state: self.state.clone(),
             atoms: self.atoms.clone(),
             finished: self.finished.clone(),
+            incomplete: self.incomplete,
         });
     }
 
@@ -191,6 +208,7 @@ impl<'a> Stepper<'a> {
                 self.state = snap.state;
                 self.atoms = snap.atoms;
                 self.finished = snap.finished;
+                self.incomplete = snap.incomplete;
                 self.pending.clear();
                 true
             }
@@ -287,12 +305,63 @@ impl<'a> Stepper<'a> {
                 Ok(Stop::stepped(false))
             }
             "if_statement" => self.enter_if(stmt),
-            // Unmodeled in v1: step over, flag opaque, don't fabricate effects.
+            // Loops model two sound world-lines: enter the body for one
+            // symbolic iteration, or skip it (zero iterations). N>1 iterations
+            // are not enumerated — interactive inspection of "what happens per
+            // iteration" is the goal, not full unrolling.
+            "while_statement" | "for_statement" | "enhanced_for_statement" => {
+                self.enter_loop(stmt, true)
+            }
+            // do-while runs its body at least once: no zero-iteration world.
+            "do_statement" => self.enter_loop(stmt, false),
+            // Still unmodeled (v1): step over. If such a construct can itself
+            // terminate the method, this path's reported outcome is unreliable.
             _ => {
+                if contains_exit(stmt) {
+                    self.incomplete = true;
+                }
                 self.advance();
                 Ok(Stop::stepped(true))
             }
         }
+    }
+
+    /// Present a loop as a choice: enter the body once, or (when `skippable`)
+    /// skip it entirely. Both resume after the loop — one symbolic iteration,
+    /// not a full unroll.
+    fn enter_loop(
+        &mut self,
+        stmt: tree_sitter::Node<'a>,
+        skippable: bool,
+    ) -> Result<Stop, SymError> {
+        self.advance(); // past the loop; every world resumes after it
+        let body = stmt.child_by_field_name("body").map(statements_of);
+
+        if !skippable {
+            // do-while: body always runs once; no branch needed.
+            if let Some(body) = body {
+                self.stack.push(Frame {
+                    stmts: body,
+                    idx: 0,
+                    label: "do-while body (1 iteration)".to_string(),
+                });
+            }
+            return Ok(Stop::stepped(false));
+        }
+
+        self.pending = vec![
+            Pending {
+                label: "loop body (1 iteration)".to_string(),
+                state: self.state.clone(),
+                body,
+            },
+            Pending {
+                label: "skip loop (0 iterations)".to_string(),
+                state: self.state.clone(),
+                body: None,
+            },
+        ];
+        Ok(self.branch_stop())
     }
 
     /// Take world-line `option` at a paused branch and resume.
@@ -416,6 +485,16 @@ fn statements_of(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     } else {
         vec![node]
     }
+}
+
+/// Does this subtree contain a `return`/`throw` that would exit the method?
+fn contains_exit(node: tree_sitter::Node) -> bool {
+    if matches!(node.kind(), "return_statement" | "throw_statement") {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    children.into_iter().any(contains_exit)
 }
 
 #[cfg(test)]
@@ -551,6 +630,99 @@ mod tests {
         let stop = s.step().unwrap();
         assert_eq!(stop.kind, StopKind::Terminated);
         assert_eq!(stop.outcome.as_deref(), Some("System.exit(1)"));
+    }
+
+    #[test]
+    fn while_loop_offers_enter_or_skip() {
+        let src = r#"class A { int m(java.util.Iterator<String> it) {
+            int n = 0;
+            while (it.hasNext()) { n = n + 1; process(it.next()); }
+            return n;
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        s.step().unwrap(); // int n = 0
+        let stop = s.step().unwrap(); // while → branch
+        assert_eq!(stop.kind, StopKind::Branch);
+        assert_eq!(stop.branches.len(), 2);
+        assert!(stop.branches.iter().any(|b| b.contains("1 iteration")));
+        assert!(stop.branches.iter().any(|b| b.contains("0 iterations")));
+    }
+
+    #[test]
+    fn entering_loop_body_steps_through_one_iteration() {
+        let src = r#"class A { String m(java.util.Iterator<String> it) {
+            while (it.hasNext()) { return "in-loop"; }
+            return "after";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // while → branch
+        let enter = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("1 iteration"))
+            .unwrap();
+        s.choose(enter).unwrap();
+        let stop = s.step().unwrap(); // return "in-loop"
+        assert_eq!(stop.outcome.as_deref(), Some("return \"in-loop\""));
+    }
+
+    #[test]
+    fn skipping_loop_resumes_after_it() {
+        let src = r#"class A { String m(java.util.Iterator<String> it) {
+            while (it.hasNext()) { return "in-loop"; }
+            return "after";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap();
+        let skip = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("0 iterations"))
+            .unwrap();
+        s.choose(skip).unwrap();
+        let stop = s.step().unwrap(); // return "after"
+        assert_eq!(stop.outcome.as_deref(), Some("return \"after\""));
+        assert!(
+            !s.is_incomplete(),
+            "skipping a loop is a sound 0-iteration world"
+        );
+    }
+
+    #[test]
+    fn do_while_body_runs_without_a_skip_choice() {
+        let src = r#"class A { String m(java.util.Iterator<String> it) {
+            do { return "body"; } while (it.hasNext());
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // do → enters body directly (no branch)
+        assert_eq!(stop.kind, StopKind::Stepped);
+        let stop = s.step().unwrap(); // return "body"
+        assert_eq!(stop.outcome.as_deref(), Some("return \"body\""));
+    }
+
+    #[test]
+    fn opaque_construct_with_exit_marks_incomplete() {
+        // A switch containing returns is stepped over (v1); the post-switch
+        // return must not be trusted, so the path is flagged incomplete.
+        let src = r#"class A { String m(int x) {
+            switch (x) { case 1: return "one"; default: return "other"; }
+            return "unreachable";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // switch → opaque step
+        assert!(stop.opaque);
+        assert!(s.is_incomplete());
+        let stop = s.step().unwrap(); // the (actually unreachable) return
+        assert_eq!(stop.kind, StopKind::Terminated);
+        assert!(
+            s.is_incomplete(),
+            "outcome reached past an exit-containing switch"
+        );
     }
 
     #[test]
