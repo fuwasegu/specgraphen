@@ -758,6 +758,50 @@ mod tests {
         assert!(s.is_finished());
     }
 
+    /// A literal assigned *before* any condition references the variable still
+    /// settles a later test — the atom is unknown at assignment time (so the
+    /// re-pin in `record_write` can't fire), but eval consults the recorded
+    /// write. `flag = true; if (!flag)` must not fork into a world where
+    /// `flag` is false (which would contradict the variable table).
+    #[test]
+    fn boolean_literal_before_first_use_settles() {
+        let src = r#"class A { int m() {
+            boolean flag = false;
+            flag = true;
+            if (!flag) { return 1; }
+            return 0;
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        // boolean flag = false; / flag = true; / (if !flag settles, no branch)
+        for _ in 0..3 {
+            assert_eq!(s.step().unwrap().kind, StopKind::Stepped);
+        }
+        let stop = s.step().unwrap();
+        assert_eq!(stop.kind, StopKind::Terminated);
+        assert_eq!(stop.outcome.as_deref(), Some("return 0"));
+    }
+
+    /// Same precision for equality-against-constant: a literal write to the
+    /// subject decides `x.equals(c)` without forking.
+    #[test]
+    fn equals_constant_after_literal_write_settles() {
+        let src = r#"class A { int m() {
+            String x = "A";
+            if (x.equals("A")) { return 1; }
+            return 0;
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        // String x = "A"; / if (x.equals("A")) settles true and enters body
+        for _ in 0..2 {
+            assert_eq!(s.step().unwrap().kind, StopKind::Stepped);
+        }
+        let stop = s.step().unwrap(); // return 1
+        assert_eq!(stop.kind, StopKind::Terminated);
+        assert_eq!(stop.outcome.as_deref(), Some("return 1"));
+    }
+
     #[test]
     fn if_pauses_and_choose_takes_a_world() {
         let src = r#"class A { String m(boolean a) {
@@ -1093,6 +1137,105 @@ mod tests {
             stop.kind,
             StopKind::Branch,
             "reassigned s must re-fork: {stop:?}"
+        );
+    }
+
+    #[test]
+    fn second_reassignment_identical_rhs_shadowed_var_reforks() {
+        // Field "C" minimal repro: kk assigned in two separate loops, both with
+        // identical RHS text (`o.trim()`), `o` a same-named shadowing loop var;
+        // the 1st loop pins kk.equals("Z")==true into the PC; the 2nd loop's
+        // reassignment must retract it so the re-test forks.
+        let src = r#"class A { boolean m(java.util.List<String> a, java.util.List<String> b) {
+            String kk = "";
+            boolean found = false;
+            for (String o : a) { kk = o.trim(); if (kk.equals("Z")) { found = true; } }
+            for (String o : b) { kk = o.trim(); if (!kk.equals("Z")) { return false; } }
+            return found;
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+
+        let pick = |s: &mut Stepper, needle: &str| {
+            let stop = s.step().unwrap();
+            assert_eq!(stop.kind, StopKind::Branch, "expected a branch: {stop:?}");
+            let i = stop
+                .branches
+                .iter()
+                .position(|b| b.contains(needle))
+                .unwrap_or_else(|| panic!("no branch matching {needle:?} in {:?}", stop.branches));
+            s.choose(i).unwrap();
+        };
+
+        s.step().unwrap(); // String kk = ""
+        s.step().unwrap(); // boolean found = false
+        pick(&mut s, "1 iteration"); // enter loop a
+        s.step().unwrap(); // kk = o.trim()
+        pick(&mut s, "{true}"); // if (kk.equals("Z")) → true; pins kk.equals("Z")==true
+        s.step().unwrap(); // found = true
+                           // fall out of loop a, reach loop b
+        pick(&mut s, "1 iteration"); // enter loop b
+        s.step().unwrap(); // kk = o.trim()  → must retract kk.equals("Z")
+        let stop = s.step().unwrap(); // if (!kk.equals("Z"))
+        assert_eq!(
+            stop.kind,
+            StopKind::Branch,
+            "2nd reassignment must retract the stale equals pin so the re-test forks: {stop:?}"
+        );
+    }
+
+    #[test]
+    fn reassign_after_closed_try_frame_reforks() {
+        // Field "C" repro per analyst: pin is set inside a loop that lives in a
+        // try{}finally{}; the try closes; a separate later loop reassigns the
+        // same local. The reassignment must still retract the stale pin.
+        let src = r#"class A { boolean m(String o0, java.util.List<String> list, boolean cond) {
+            String kk = "";
+            boolean found = false;
+            try {
+                while (cond) {
+                    kk = o0.trim();
+                    if (kk.equals("Z")) { found = true; }
+                }
+            } finally { cleanup(); }
+            for (String o : list) {
+                kk = o.trim();
+                if (!kk.equals("Z")) { return false; }
+            }
+            return found;
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+
+        let pick = |s: &mut Stepper, needle: &str| {
+            let stop = s.step().unwrap();
+            assert_eq!(stop.kind, StopKind::Branch, "expected branch: {stop:?}");
+            let i = stop
+                .branches
+                .iter()
+                .position(|b| b.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in {:?}", stop.branches));
+            s.choose(i).unwrap();
+        };
+
+        // Drive to the pin, through the try/finally, into loop2, to the re-test.
+        // Step until we either reach the second `if (!kk.equals("Z"))` (Branch)
+        // or run to a terminal, choosing the pinning/iterating worlds en route.
+        s.step().unwrap(); // String kk = ""
+        s.step().unwrap(); // boolean found = false
+        s.step().unwrap(); // try → enter (pushes finally, then try body)
+        pick(&mut s, "1 iteration"); // while → enter body
+        s.step().unwrap(); // kk = o0.trim()
+        pick(&mut s, "{true}"); // if (kk.equals("Z")) → pin kk.equals("Z")==true
+        s.step().unwrap(); // found = true
+        s.step().unwrap(); // cleanup() (finally)
+        pick(&mut s, "1 iteration"); // for-each list → enter body
+        s.step().unwrap(); // kk = o.trim() → must retract kk.equals("Z")
+        let stop = s.step().unwrap(); // if (!kk.equals("Z"))
+        assert_eq!(
+            stop.kind,
+            StopKind::Branch,
+            "reassignment after a closed try frame must retract the stale pin: {stop:?}"
         );
     }
 

@@ -195,6 +195,17 @@ impl Evaluator<'_> {
             return Ok(vec![(state, value)]);
         }
 
+        // A recorded concrete write can settle the atom outright, even when no
+        // condition interned it before the assignment (so the re-pin in
+        // `record_write` never fired): `flag = true; … if (!flag)` and
+        // `x = "A"; … if (x.equals("A"))` follow the assigned value instead
+        // of re-forking into a world that contradicts the variable table.
+        if let Some(value) = resolved_by_write(&label, &state) {
+            let mut st = state;
+            st.conds.push((id, value));
+            return Ok(vec![(st, value)]);
+        }
+
         // Mutual exclusion: `X.equals(c1)` / `X == c1` is false if a sibling
         // `X.equals(c2)` / `X == c2` (different constant) is already pinned
         // true — a value can't equal two distinct constants. Without this the
@@ -341,6 +352,24 @@ fn equality_constant(label: &str) -> Option<(&str, &str)> {
         }
     }
     None
+}
+
+/// If a recorded concrete write determines this atom's truth, return it.
+/// Covers a bare boolean variable assigned `true`/`false`, and an
+/// equality-against-constant atom whose subject was last assigned a literal
+/// (`x = "A"` ⇒ `x.equals("A")` is true, `x.equals("B")` is false).
+/// A non-literal last write (a method call, another variable) is unknowable,
+/// so the atom keeps forking.
+fn resolved_by_write(label: &str, state: &SymState) -> Option<bool> {
+    if let Some((subj, lit)) = equality_constant(label) {
+        let v = state.writes.get(subj)?;
+        return is_literal(v).then(|| v == lit);
+    }
+    match state.writes.get(label).map(String::as_str) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
 }
 
 /// A string/char/number literal token (heuristic, on normalized text).
