@@ -38,6 +38,7 @@
 //! unmodeled.
 
 use specgraphen_logic::{DecisionTable, Tri};
+use specgraphen_vm::sym::{self, named_children, normalize, text};
 
 /// Atom cap mirrors the minimizer's variable limit.
 const MAX_ATOMS: usize = specgraphen_logic::MAX_VARIABLES;
@@ -213,7 +214,7 @@ fn extract_method(
 
     let mut walker = Walker {
         src,
-        atoms: Vec::new(),
+        atoms: specgraphen_vm::AtomTable::new(MAX_ATOMS),
         locals: parameter_names(node, src),
         terminal_calls,
         suffix_cache: std::collections::HashMap::new(),
@@ -270,7 +271,7 @@ fn extract_method(
                 acc.intersection(&set).copied().collect()
             });
 
-    let mut table = DecisionTable::new(walker.atoms.clone());
+    let mut table = DecisionTable::new(walker.atoms.names().to_vec());
     for ((state, core), effects) in walker.paths.iter().zip(&path_effects) {
         let distinct: Vec<&str> = effects
             .iter()
@@ -304,16 +305,9 @@ fn extract_method(
 /// A conjunction of condition-atom assignments: (atom index, value).
 type Conds = Vec<(usize, bool)>;
 
-/// Per-path symbolic state: condition-atom assignments plus observable effects.
-#[derive(Debug, Clone, Default)]
-struct State {
-    conds: Conds,
-    /// Normalized assignment target → last assigned value text along this path.
-    writes: std::collections::BTreeMap<String, String>,
-    /// Statement-level method calls along this path (`abortOnError()`,
-    /// `sendNotification(...)` …) — in legacy code these ARE the outcome.
-    calls: std::collections::BTreeSet<String>,
-}
+/// Per-path symbolic state — the shared symbolic-execution model from
+/// `specgraphen-vm` (condition atoms + observable writes/calls).
+type State = specgraphen_vm::SymState;
 
 /// Chain of "conditions still to be tested" sets: the suffix of the current
 /// statement list plus every enclosing continuation. Used to decide whether
@@ -331,7 +325,7 @@ impl Future<'_> {
 
 struct Walker<'a> {
     src: &'a [u8],
-    atoms: Vec<String>,
+    atoms: specgraphen_vm::AtomTable,
     /// Names that cannot escape the method (parameters and declared locals);
     /// writes to them are invisible in outcomes unless returned.
     locals: std::collections::HashSet<String>,
@@ -414,14 +408,16 @@ impl Walker<'_> {
             "expression_statement" => {
                 let mut state = state;
                 if let Some(expr) = named_children(stmt).first() {
-                    if expr.kind() == "method_invocation" && self.is_terminal_call(*expr) {
+                    if expr.kind() == "method_invocation"
+                        && sym::is_terminal_call(*expr, self.src, self.terminal_calls)
+                    {
                         // Process-terminating call: the path ends here; any
                         // code after it is unreachable on this path.
                         let call = normalize(&text(*expr, self.src));
                         self.paths.push((state, call));
                         return Ok(Vec::new());
                     }
-                    self.record_write(*expr, &mut state);
+                    sym::record_write(*expr, self.src, &mut state);
                 }
                 self.walk(stmts, idx + 1, state, beyond)
             }
@@ -594,7 +590,7 @@ impl Walker<'_> {
             for cube in &current {
                 for k in 0..cube.len() {
                     let (atom, val) = cube[k];
-                    if future.contains(&self.atoms[atom]) {
+                    if future.contains(self.atoms.name(atom)) {
                         continue;
                     }
                     let mut reduced = cube.clone();
@@ -648,186 +644,34 @@ impl Walker<'_> {
         }
     }
 
-    /// Does this invocation match a configured process-terminating callee?
-    /// Matches the bare name (`abortOnError`) or `receiver.name` (`System.exit`).
-    fn is_terminal_call(&self, invocation: tree_sitter::Node) -> bool {
-        let Some(name) = invocation.child_by_field_name("name") else {
-            return false;
-        };
-        let name = text(name, self.src);
-        let dotted = invocation
-            .child_by_field_name("object")
-            .map(|o| format!("{}.{}", text(o, self.src), name));
-        self.terminal_calls
-            .iter()
-            .any(|t| *t == name || Some(t.as_str()) == dotted.as_deref())
-    }
-
-    /// Record an assignment / increment as a symbolic write. Anything else
-    /// (method calls etc.) is ignored — their side effects are not modeled.
-    fn record_write(&mut self, expr: tree_sitter::Node, state: &mut State) {
-        match expr.kind() {
-            "assignment_expression" => {
-                let (Some(left), Some(right)) = (
-                    expr.child_by_field_name("left"),
-                    expr.child_by_field_name("right"),
-                ) else {
-                    return;
-                };
-                let target = normalize(&text(left, self.src));
-                let operator = expr
-                    .child_by_field_name("operator")
-                    .map(|n| text(n, self.src))
-                    .unwrap_or_default();
-                // Compound assignment (`+=` …) has no simple value; keep the
-                // whole expression text — outcomes still distinguish the paths.
-                let value = if operator == "=" {
-                    normalize(&text(right, self.src))
-                } else {
-                    normalize(&text(expr, self.src))
-                };
-                state.writes.insert(target, value);
-            }
-            "update_expression" => {
-                // i++ / --i: opaque value, but an observable write
-                let whole = normalize(&text(expr, self.src));
-                let target = whole.trim_matches(['+', '-', ' ']).to_string();
-                if !target.is_empty() {
-                    state.writes.insert(target, whole);
-                }
-            }
-            "method_invocation" => {
-                // Statement-level calls (error exits, state mutations) are
-                // observable behavior — without them, branches that only call
-                // out are reported as falsely dead. Logging is excluded: it is
-                // not business behavior, and per-branch log messages would
-                // otherwise explode the outcome alphabet and kill compression.
-                let call = normalize(&text(expr, self.src));
-                if !is_logging_call(&call) {
-                    state.calls.insert(call);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Evaluate a condition with short-circuit path semantics.
-    /// Returns every (state, truth-value) pair the condition can produce.
+    /// Evaluate a condition through the shared `specgraphen-vm` semantics
+    /// (short-circuit decomposition, atom interning, feasibility).
     fn eval(
         &mut self,
         node: tree_sitter::Node,
         state: State,
     ) -> Result<Vec<(State, bool)>, String> {
-        match node.kind() {
-            "parenthesized_expression" => {
-                let inner = named_children(node);
-                let inner = inner.first().ok_or("empty parentheses")?;
-                self.eval(*inner, state)
-            }
-            "unary_expression" => {
-                let op = node
-                    .child_by_field_name("operator")
-                    .map(|n| text(n, self.src));
-                let operand = node
-                    .child_by_field_name("operand")
-                    .ok_or("unary without operand")?;
-                if op.as_deref() == Some("!") {
-                    Ok(self
-                        .eval(operand, state)?
-                        .into_iter()
-                        .map(|(s, v)| (s, !v))
-                        .collect())
-                } else {
-                    self.atom(node, state)
-                }
-            }
-            "binary_expression" => {
-                let op = node
-                    .child_by_field_name("operator")
-                    .map(|n| text(n, self.src))
-                    .unwrap_or_default();
-                match op.as_str() {
-                    "&&" => self.short_circuit(node, state, true),
-                    "||" => self.short_circuit(node, state, false),
-                    _ => self.atom(node, state),
-                }
-            }
-            "true" => Ok(vec![(state, true)]),
-            "false" => Ok(vec![(state, false)]),
-            _ => self.atom(node, state),
-        }
+        let mut ev = sym::Evaluator {
+            src: self.src,
+            atoms: &mut self.atoms,
+        };
+        ev.eval(node, state).map_err(|e| e.to_string())
     }
 
-    /// `&&` (and=true): left=false short-circuits to false; left=true
-    /// continues into the right operand. `||` is the mirror image.
-    fn short_circuit(
-        &mut self,
-        node: tree_sitter::Node,
-        state: State,
-        and: bool,
-    ) -> Result<Vec<(State, bool)>, String> {
-        let left = node.child_by_field_name("left").ok_or("missing lhs")?;
-        let right = node.child_by_field_name("right").ok_or("missing rhs")?;
-
-        let mut results = Vec::new();
-        for (s, v) in self.eval(left, state)? {
-            if v == and {
-                results.extend(self.eval(right, s)?);
-            } else {
-                results.push((s, v));
-            }
-        }
-        Ok(results)
-    }
-
-    fn atom_id(&mut self, label: String) -> Result<usize, String> {
-        match self.atoms.iter().position(|a| a == &label) {
-            Some(id) => Ok(id),
-            None => {
-                if self.atoms.len() >= MAX_ATOMS {
-                    return Err(format!("more than {MAX_ATOMS} distinct conditions"));
-                }
-                self.atoms.push(label);
-                Ok(self.atoms.len() - 1)
-            }
-        }
-    }
-
-    /// Treat `node` as an atomic condition: same normalized text, same variable.
-    /// A path that already assigned this atom follows that value (feasibility).
-    fn atom(
-        &mut self,
-        node: tree_sitter::Node,
-        state: State,
-    ) -> Result<Vec<(State, bool)>, String> {
-        let label = normalize(&text(node, self.src));
-        let id = self.atom_id(label)?;
-
-        if let Some(&(_, value)) = state.conds.iter().find(|(a, _)| *a == id) {
-            return Ok(vec![(state, value)]);
-        }
-
-        let mut true_state = state.clone();
-        true_state.conds.push((id, true));
-        let mut false_state = state;
-        false_state.conds.push((id, false));
-        Ok(vec![(true_state, true), (false_state, false)])
-    }
-
-    /// Try to assign `label = value` on a path. Returns false when the path
-    /// already pinned the atom to the opposite value (infeasible fork).
+    /// Pin `label = value` on a path (shared semantics). Returns false when the
+    /// path already pinned the atom to the opposite value (infeasible fork).
     fn assign_atom(
         &mut self,
         label: String,
         value: bool,
         state: &mut State,
     ) -> Result<bool, String> {
-        let id = self.atom_id(label)?;
-        if let Some(&(_, existing)) = state.conds.iter().find(|(a, _)| *a == id) {
-            return Ok(existing == value);
-        }
-        state.conds.push((id, value));
-        Ok(true)
+        let mut ev = sym::Evaluator {
+            src: self.src,
+            atoms: &mut self.atoms,
+        };
+        ev.assign_atom(&label, value, state)
+            .map_err(|e| e.to_string())
     }
 
     /// Model a clean `switch` with else-if-chain semantics: entering case k
@@ -985,22 +829,6 @@ impl Walker<'_> {
     }
 }
 
-/// Logging receivers conventional in (legacy) Java. Branches that only log
-/// are treated as having no observable effect — for spec extraction that is
-/// the desired reading, and it keeps outcome classes compressible.
-const LOGGING_PREFIXES: &[&str] = &[
-    "logger.",
-    "log.",
-    "LOG.",
-    "Logger.",
-    "System.out.",
-    "System.err.",
-];
-
-fn is_logging_call(call: &str) -> bool {
-    LOGGING_PREFIXES.iter().any(|p| call.starts_with(p))
-}
-
 /// Collect the atom texts a subtree can test, mirroring the walker's
 /// atomization (if-conditions decomposed through parens/`!`/`&&`/`||`,
 /// switch subjects as `subject == value` labels). Over-inclusion is safe —
@@ -1118,13 +946,6 @@ fn parameter_names(method: tree_sitter::Node, src: &[u8]) -> std::collections::H
     names
 }
 
-fn named_children(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|n| n.kind() != "line_comment" && n.kind() != "block_comment")
-        .collect()
-}
-
 /// Statement list of a branch body: a block's children, or the single statement.
 fn statements_of(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     if node.kind() == "block" {
@@ -1141,14 +962,6 @@ fn contains_exit(node: tree_sitter::Node) -> bool {
     let mut cursor = node.walk();
     let children: Vec<_> = node.children(&mut cursor).collect();
     children.into_iter().any(contains_exit)
-}
-
-fn text(node: tree_sitter::Node, src: &[u8]) -> String {
-    node.utf8_text(src).unwrap_or_default().to_string()
-}
-
-fn normalize(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

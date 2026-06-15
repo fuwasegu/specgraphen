@@ -1,0 +1,13 @@
+[package]
+name = "specgraphen-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resumable symbolic stepper over Java ASTs — the shared execution core behind decision-table extraction and interactive static debugging"
+
+[dependencies]
+tree-sitter = "0.24"
+
+[dev-dependencies]
+tree-sitter-java = "0.23"

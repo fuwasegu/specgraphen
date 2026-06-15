@@ -1357,6 +1357,7 @@ dependencies = [
  "serde_json",
  "specgraphen-logic",
  "specgraphen-model",
+ "specgraphen-vm",
  "thiserror",
  "tracing",
  "tree-sitter",
@@ -1456,6 +1457,14 @@ dependencies = [
  "specgraphen-model",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "specgraphen-vm"
+version = "1.5.0"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-java",
 ]
 
 [[package]]
