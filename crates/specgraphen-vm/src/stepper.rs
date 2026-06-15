@@ -16,11 +16,15 @@
 //! sound world-lines (N>1 not enumerated). A clean `switch` (every group ends
 //! in break/return/throw, or arrow rules) becomes one world-line per case with
 //! sequential-exclusivity atoms, sharing [`sym::parse_switch`] with the batch
-//! extractor. `try` and fall-through/conditional-break `switch` are still
-//! stepped over as opaque statements (flagged via [`Stop::opaque`]); if such a
-//! skipped construct can itself return/throw, the path is marked
-//! [`Stepper::is_incomplete`] so its outcome isn't trusted. Method calls are
-//! recorded as effects, not descended into (no cross-method step-into yet).
+//! extractor. Wrapper constructs are entered, not skipped: `try` steps the
+//! no-exception happy path (body then finally; catch worlds aren't enumerated),
+//! and `synchronized`/labeled statements step into their body — so logic buried
+//! inside a method-wide `try` (the legacy norm) is reachable. Only
+//! fall-through/conditional-break `switch` remains opaque (flagged via
+//! [`Stop::opaque`]); if such a skipped construct can itself return/throw, the
+//! path is marked [`Stepper::is_incomplete`] so its outcome isn't trusted.
+//! Method calls are recorded as effects, not descended into (no cross-method
+//! step-into yet).
 
 use crate::sym::{self, AtomTable, Evaluator, SymError, SymState};
 
@@ -318,6 +322,12 @@ impl<'a> Stepper<'a> {
             // do-while runs its body at least once: no zero-iteration world.
             "do_statement" => self.enter_loop(stmt, false),
             "switch_expression" | "switch_statement" => self.enter_switch(stmt),
+            // Wrapper constructs whose body holds the real logic: step into it
+            // rather than skipping. `try` models the no-exception happy path —
+            // body then finally; catch (exception worlds) is not enumerated.
+            "try_statement" | "try_with_resources_statement" => self.enter_try(stmt),
+            "synchronized_statement" => self.enter_wrapper(stmt),
+            "labeled_statement" => self.enter_labeled(stmt),
             // Still unmodeled: step over. If such a construct can itself
             // terminate the method, this path's reported outcome is unreliable.
             _ => {
@@ -480,6 +490,70 @@ impl<'a> Stepper<'a> {
         Ok(Stop::stepped(false))
     }
 
+    /// `try { BODY } catch ... finally { FIN }` — step the no-exception world:
+    /// run BODY, then FIN, then continue after the try. Catch clauses
+    /// (exception worlds) are not enumerated in v1. Resources of a
+    /// try-with-resources are treated as opaque (not modeled).
+    fn enter_try(&mut self, stmt: tree_sitter::Node<'a>) -> Result<Stop, SymError> {
+        self.advance(); // past the try; everything resumes after it
+
+        let mut cursor = stmt.walk();
+        let children: Vec<tree_sitter::Node> = stmt.children(&mut cursor).collect();
+
+        // finally runs after the body — push it first so it executes second.
+        if let Some(fin) = children.iter().find(|c| c.kind() == "finally_clause") {
+            if let Some(block) = block_child(*fin) {
+                self.stack.push(Frame {
+                    stmts: sym::named_children(block),
+                    idx: 0,
+                    label: "finally".to_string(),
+                });
+            }
+        }
+        if let Some(body) = stmt
+            .child_by_field_name("body")
+            .or_else(|| block_child(stmt))
+        {
+            self.stack.push(Frame {
+                stmts: sym::named_children(body),
+                idx: 0,
+                label: "try body".to_string(),
+            });
+        }
+        Ok(Stop::stepped(false))
+    }
+
+    /// `synchronized (x) { BODY }` — the lock is irrelevant to symbolic logic;
+    /// step into the body.
+    fn enter_wrapper(&mut self, stmt: tree_sitter::Node<'a>) -> Result<Stop, SymError> {
+        self.advance();
+        if let Some(body) = stmt
+            .child_by_field_name("body")
+            .or_else(|| block_child(stmt))
+        {
+            self.stack.push(Frame {
+                stmts: sym::named_children(body),
+                idx: 0,
+                label: "synchronized".to_string(),
+            });
+        }
+        Ok(Stop::stepped(false))
+    }
+
+    /// `label: stmt` — step into the labeled statement.
+    fn enter_labeled(&mut self, stmt: tree_sitter::Node<'a>) -> Result<Stop, SymError> {
+        self.advance();
+        // The inner statement is the last named child (after the label id).
+        if let Some(inner) = sym::named_children(stmt).into_iter().next_back() {
+            self.stack.push(Frame {
+                stmts: statements_of(inner),
+                idx: 0,
+                label: "labeled".to_string(),
+            });
+        }
+        Ok(Stop::stepped(false))
+    }
+
     /// Pop the current frame (finish the enclosing block/branch and resume the
     /// parent after it). No-op at the top frame.
     pub fn step_out(&mut self) -> Result<Stop, SymError> {
@@ -578,6 +652,14 @@ fn statements_of(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     } else {
         vec![node]
     }
+}
+
+/// The first direct `block` child of a node (for constructs whose body block
+/// isn't exposed under a field name).
+fn block_child(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    children.into_iter().find(|c| c.kind() == "block")
 }
 
 /// Does this subtree contain a `return`/`throw` that would exit the method?
@@ -829,16 +911,63 @@ mod tests {
     }
 
     #[test]
-    fn unmodelable_construct_with_exit_marks_incomplete() {
-        // A try/finally containing a return is stepped over (still opaque);
-        // the post-try return must not be trusted, so the path is incomplete.
-        let src = r#"class A { String m() {
-            try { return "in-try"; } finally { cleanup(); }
-            return "unreachable";
+    fn try_body_is_entered_so_inner_logic_is_reachable() {
+        // The real legacy shape: business logic (here a loop) lives inside a
+        // try. Entering the try body must make that loop reachable.
+        let src = r#"class A { String m(java.util.Iterator<String> it) {
+            try {
+                while (it.hasNext()) { return "in-loop"; }
+            } finally {
+                cleanup();
+            }
+            return "after";
         } }"#;
         let tree = parse(src);
         let mut s = stepper_for(&tree, src.as_bytes());
-        let stop = s.step().unwrap(); // try → opaque step
+        let stop = s.step().unwrap(); // try → enter body (not opaque)
+        assert!(!stop.opaque, "try body should be entered, not skipped");
+        assert!(!s.is_incomplete());
+        let stop = s.step().unwrap(); // while → loop branch
+        assert_eq!(stop.kind, StopKind::Branch);
+        let enter = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("1 iteration"))
+            .unwrap();
+        s.choose(enter).unwrap();
+        let stop = s.step().unwrap(); // return "in-loop"
+        assert_eq!(stop.outcome.as_deref(), Some("return \"in-loop\""));
+    }
+
+    #[test]
+    fn try_finally_runs_after_body() {
+        let src = r#"class A { void m() {
+            try { this.a = 1; } finally { this.b = 2; }
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        s.step().unwrap(); // enter try → pushes finally then body
+                           // step until we've executed both writes or run out
+        let mut guard = 0;
+        while !s.is_finished() && guard < 20 {
+            s.step().unwrap();
+            guard += 1;
+        }
+        assert_eq!(s.state().writes.get("this.a"), Some(&"1".to_string()));
+        assert_eq!(s.state().writes.get("this.b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn fallthrough_switch_with_exit_marks_incomplete() {
+        // case 1 falls into case 2 (no break) → unmodelable → opaque; it
+        // contains a return, so the post-switch outcome is untrusted.
+        let src = r#"class A { String m(int x) {
+            switch (x) { case 1: doOne(); case 2: return "two"; default: break; }
+            return "after";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // switch → opaque (fall-through)
         assert!(stop.opaque);
         assert!(s.is_incomplete());
     }
