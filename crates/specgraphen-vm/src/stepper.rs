@@ -981,10 +981,10 @@ mod tests {
 
     #[test]
     fn reassigned_flag_is_not_stale_pinned() {
-        // The real legacy shape (BF L1015/L1017): a flag is tested, reassigned
-        // true in the same region, then re-tested. The old behavior pinned the
-        // first test's value and contradicted the assignment; now the literal
-        // re-pin makes the re-test follow the assigned value.
+        // A common legacy shape: a flag is tested, reassigned true in the same
+        // region, then re-tested. The old behavior pinned the first test's
+        // value and contradicted the assignment; now the literal re-pin makes
+        // the re-test follow the assigned value.
         let src = r#"class A { String m() {
             if (!flag) {
                 flag = true;
