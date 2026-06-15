@@ -26,10 +26,14 @@
 //!
 //! ## Limits
 //!
-//! Minimization is exponential in the variable count; tables are capped at
-//! [`MAX_VARIABLES`] variables and rejected beyond that. Partition large
-//! condition sets upstream before calling [`compress`].
+//! Up to [`EXACT_MAX_VARIABLES`] variables, minimization is exact
+//! Quine-McCluskey (guaranteed-minimum covers). Beyond that — up to
+//! [`MAX_VARIABLES`] — an Espresso-style cube heuristic is used: rules are
+//! still maximally general and exactly faithful to the observed rows, but
+//! the cover is near-minimal rather than guaranteed minimum. Tables wider
+//! than [`MAX_VARIABLES`] are rejected; partition upstream.
 
+mod cube_min;
 mod qm;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,8 +41,13 @@ use std::fmt;
 
 use qm::{prime_implicants, select_cover, Cube};
 
-/// Upper bound on variables per table (minterm space is `2^n`).
-pub const MAX_VARIABLES: usize = 16;
+/// Hard upper bound on variables per table.
+pub const MAX_VARIABLES: usize = 64;
+/// Widest table minimized exactly (minterm space is `2^n`); wider tables
+/// up to [`MAX_VARIABLES`] use the cube heuristic. 12 keeps the exact
+/// path's quadratic cover selection comfortably fast (4096 minterms);
+/// at 16 it measurably stalls (minutes in debug builds).
+pub const EXACT_MAX_VARIABLES: usize = 12;
 
 /// Value of one condition along one observed path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -184,6 +193,27 @@ pub fn compress(table: &DecisionTable) -> Result<CompressedTable, Error> {
         });
     }
 
+    let rules = if n <= EXACT_MAX_VARIABLES {
+        exact_rules(table, n)?
+    } else {
+        cube_rules(table)?
+    };
+
+    let dead_variables: Vec<String> = (0..n)
+        .filter(|&i| rules.iter().all(|r| r.when[i] == Tri::Any))
+        .map(|i| table.variables[i].clone())
+        .collect();
+
+    Ok(CompressedTable {
+        variables: table.variables.clone(),
+        rules,
+        dead_variables,
+    })
+}
+
+/// Exact path (n ≤ [`EXACT_MAX_VARIABLES`]): minterm-space Quine-McCluskey
+/// with guaranteed-minimum covers.
+fn exact_rules(table: &DecisionTable, n: usize) -> Result<Vec<Rule>, Error> {
     // Expand rows into minterm → outcome, detecting contradictions.
     let mut outcome_labels: Vec<String> = Vec::new();
     let mut outcome_index: HashMap<String, usize> = HashMap::new();
@@ -266,17 +296,65 @@ pub fn compress(table: &DecisionTable) -> Result<CompressedTable, Error> {
             });
         }
     }
+    Ok(rules)
+}
 
-    let dead_variables: Vec<String> = (0..n)
-        .filter(|&i| rules.iter().all(|r| r.when[i] == Tri::Any))
-        .map(|i| table.variables[i].clone())
+/// Heuristic path (n > [`EXACT_MAX_VARIABLES`]): Espresso-style cube
+/// expansion — never enumerates the minterm space, so it scales with the
+/// row count instead of `2^n`. Covers are near-minimal, not guaranteed
+/// minimum.
+fn cube_rules(table: &DecisionTable) -> Result<Vec<Rule>, Error> {
+    use cube_min::BitCube;
+    let n = table.variables.len();
+
+    let cubes: Vec<BitCube> = table
+        .rows
+        .iter()
+        .map(|r| BitCube::from_tris(&r.inputs))
         .collect();
 
-    Ok(CompressedTable {
-        variables: table.variables.clone(),
-        rules,
-        dead_variables,
-    })
+    // Conflict detection without enumeration: two observed rows of
+    // different outcomes that intersect share a full assignment.
+    for (i, a) in table.rows.iter().enumerate() {
+        for (j, b) in table.rows.iter().enumerate().skip(i + 1) {
+            if a.outcome != b.outcome && cubes[i].intersects(cubes[j]) {
+                let witness = cubes[i].intersection_witness(cubes[j], n);
+                return Err(Error::Conflict {
+                    assignment: table.variables.iter().cloned().zip(witness).collect(),
+                    outcomes: (a.outcome.clone(), b.outcome.clone()),
+                });
+            }
+        }
+    }
+
+    let mut labels: Vec<&String> = table.rows.iter().map(|r| &r.outcome).collect();
+    labels.sort();
+    labels.dedup();
+
+    let mut rules: Vec<Rule> = Vec::new();
+    for label in labels {
+        let on: Vec<BitCube> = table
+            .rows
+            .iter()
+            .zip(&cubes)
+            .filter(|(r, _)| &r.outcome == label)
+            .map(|(_, c)| *c)
+            .collect();
+        let off: Vec<BitCube> = table
+            .rows
+            .iter()
+            .zip(&cubes)
+            .filter(|(r, _)| &r.outcome != label)
+            .map(|(_, c)| *c)
+            .collect();
+        for cube in cube_min::minimize(&on, &off, n) {
+            rules.push(Rule {
+                when: cube.to_tris(n),
+                outcome: label.clone(),
+            });
+        }
+    }
+    Ok(rules)
 }
 
 fn cube_to_tris(cube: Cube, n: usize) -> Vec<Tri> {
@@ -528,13 +606,126 @@ mod tests {
 
     #[test]
     fn too_many_variables_is_an_error() {
-        let vars: Vec<String> = (0..17).map(|i| format!("v{i}")).collect();
+        let vars: Vec<String> = (0..65).map(|i| format!("v{i}")).collect();
         let mut t = DecisionTable::new(vars);
-        t.add_row(vec![Any; 17], "x").unwrap();
+        t.add_row(vec![Any; 65], "x").unwrap();
         assert_eq!(
             compress(&t),
-            Err(Error::TooManyVariables { count: 17, max: 16 })
+            Err(Error::TooManyVariables { count: 65, max: 64 })
         );
+    }
+
+    /// Build a wide table: n vars, rows given as (sparse assignments, outcome).
+    fn wide_table(n: usize, rows: &[(&[(usize, Tri)], &str)]) -> DecisionTable {
+        let vars: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+        let mut t = DecisionTable::new(vars);
+        for (assignments, outcome) in rows {
+            let mut inputs = vec![Any; n];
+            for &(i, tri) in *assignments {
+                inputs[i] = tri;
+            }
+            t.add_row(inputs, *outcome).unwrap();
+        }
+        t
+    }
+
+    /// Soundness for the heuristic path: every rule avoids all rows of
+    /// other outcomes, and every row is contained in one of its own rules.
+    fn assert_cube_faithful(t: &DecisionTable, c: &CompressedTable) {
+        let matches =
+            |rule: &Rule, row: &[Tri]| rule.when.iter().zip(row).all(|(r, x)| *r == Any || r == x);
+        let intersects = |rule: &Rule, row: &[Tri]| {
+            rule.when
+                .iter()
+                .zip(row)
+                .all(|(r, x)| !matches!((r, x), (Tri::True, Tri::False) | (Tri::False, Tri::True)))
+        };
+        for row in t.rows() {
+            assert!(
+                c.rules
+                    .iter()
+                    .any(|r| r.outcome == row.outcome && matches(r, &row.inputs)),
+                "row not covered: {row:?}"
+            );
+            assert!(
+                !c.rules
+                    .iter()
+                    .any(|r| r.outcome != row.outcome && intersects(r, &row.inputs)),
+                "foreign rule claims part of row: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_table_compresses_via_cube_heuristic() {
+        // 20 variables (past the exact limit); outcome depends only on v0
+        let t = wide_table(
+            20,
+            &[
+                (&[(0, T), (5, T)], "yes"),
+                (&[(0, T), (5, F)], "yes"),
+                (&[(0, F), (9, T)], "no"),
+                (&[(0, F), (9, F)], "no"),
+            ],
+        );
+        let c = compress(&t).unwrap();
+        assert_cube_faithful(&t, &c);
+        assert_eq!(c.rules.len(), 2);
+        assert_eq!(c.dead_variables.len(), 19, "{:?}", c.rules);
+    }
+
+    #[test]
+    fn wide_table_keeps_interacting_conditions() {
+        // 18 vars; v0 XNOR v1 decides — neither may be reported dead
+        let t = wide_table(
+            18,
+            &[
+                (&[(0, T), (1, T)], "eq"),
+                (&[(0, F), (1, F)], "eq"),
+                (&[(0, T), (1, F)], "ne"),
+                (&[(0, F), (1, T)], "ne"),
+            ],
+        );
+        let c = compress(&t).unwrap();
+        assert_cube_faithful(&t, &c);
+        assert!(!c.dead_variables.contains(&"v0".to_string()));
+        assert!(!c.dead_variables.contains(&"v1".to_string()));
+        assert_eq!(c.rules.len(), 4);
+    }
+
+    #[test]
+    fn wide_table_conflict_is_detected() {
+        let t = wide_table(20, &[(&[(3, T)], "yes"), (&[(7, T)], "no")]);
+        // rows intersect (e.g. v3=T, v7=T) with different outcomes
+        match compress(&t) {
+            Err(Error::Conflict { outcomes, .. }) => {
+                assert_eq!(outcomes, ("yes".to_string(), "no".to_string()));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_and_heuristic_agree_at_the_boundary() {
+        // Same logical function on both sides of the exact/heuristic
+        // boundary: dead-variable verdicts must match.
+        for n in [EXACT_MAX_VARIABLES, EXACT_MAX_VARIABLES + 1] {
+            let t = wide_table(
+                n,
+                &[
+                    (&[(0, T), (1, T)], "yes"),
+                    (&[(0, T), (1, F)], "yes"),
+                    (&[(0, F)], "no"),
+                ],
+            );
+            let c = compress(&t).unwrap();
+            assert_eq!(c.rules.len(), 2, "n={n}: {:?}", c.rules);
+            assert!(
+                c.dead_variables.contains(&"v1".to_string()),
+                "n={n}: {:?}",
+                c.dead_variables
+            );
+        }
     }
 
     #[test]

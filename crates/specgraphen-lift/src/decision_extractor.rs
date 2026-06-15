@@ -21,18 +21,33 @@
 //! produce infeasible don't-cares. Configurable terminal calls
 //! (`System.exit` built in) end a path where they occur.
 //!
+//! At each join, fall-through states that cannot behave differently from
+//! there on are merged (identical effects, and any condition not tested
+//! again is dropped when both of its values are present). This is what lets
+//! methods with many conditions stay tractable — long chains of
+//! effect-free guards collapse instead of producing `2^n` paths — and feeds
+//! the downstream minimizer, which itself switches from exact
+//! Quine-McCluskey to a cube heuristic past 12 variables.
+//!
 //! Honesty over coverage: constructs this walker does not model (loops,
 //! `try`, fall-through/conditional-break `switch`, …) mark the method
 //! [`MethodDecision::incomplete`] when they can terminate the method
-//! (contain `return`/`throw`), methods exceeding the atom/path caps are
-//! skipped with a reason instead of producing a partial table, and side
-//! effects of method calls (`list.add(...)` …) remain unmodeled.
+//! (contain `return`/`throw`); methods exceeding the atom, path, or
+//! work-step caps are skipped with a reason instead of producing a partial
+//! table; and side effects of method calls (`list.add(...)` …) remain
+//! unmodeled.
 
 use specgraphen_logic::{DecisionTable, Tri};
 
 /// Atom cap mirrors the minimizer's variable limit.
 const MAX_ATOMS: usize = specgraphen_logic::MAX_VARIABLES;
-const MAX_PATHS: usize = 512;
+const MAX_PATHS: usize = 4096;
+/// Hard ceiling on total walk steps, so a method whose branch structure
+/// defeats state-merging (distinct effects per branch force exponential
+/// suffix re-walks) is abandoned quickly rather than grinding toward the
+/// path cap. Tractable methods — even wide ones — stay well under this;
+/// only genuinely intractable structure exceeds it.
+const MAX_STEPS: usize = 500_000;
 
 /// Decision table extracted from one method.
 #[derive(Debug)]
@@ -201,12 +216,14 @@ fn extract_method(
         atoms: Vec::new(),
         locals: parameter_names(node, src),
         terminal_calls,
+        suffix_cache: std::collections::HashMap::new(),
+        steps: 0,
         paths: Vec::new(),
         incomplete: false,
     };
 
     let stmts = named_children(body);
-    match walker.walk(&stmts, 0, State::default()) {
+    match walker.walk(&stmts, 0, State::default(), None) {
         Ok(fallthroughs) => {
             for state in fallthroughs {
                 walker.paths.push((state, "(fall-through)".to_string()));
@@ -284,15 +301,32 @@ fn extract_method(
     });
 }
 
+/// A conjunction of condition-atom assignments: (atom index, value).
+type Conds = Vec<(usize, bool)>;
+
 /// Per-path symbolic state: condition-atom assignments plus observable effects.
 #[derive(Debug, Clone, Default)]
 struct State {
-    conds: Vec<(usize, bool)>,
+    conds: Conds,
     /// Normalized assignment target → last assigned value text along this path.
     writes: std::collections::BTreeMap<String, String>,
     /// Statement-level method calls along this path (`abortOnError()`,
     /// `sendNotification(...)` …) — in legacy code these ARE the outcome.
     calls: std::collections::BTreeSet<String>,
+}
+
+/// Chain of "conditions still to be tested" sets: the suffix of the current
+/// statement list plus every enclosing continuation. Used to decide whether
+/// a condition atom can still influence the remainder of the method.
+struct Future<'a> {
+    set: std::rc::Rc<std::collections::HashSet<String>>,
+    parent: Option<&'a Future<'a>>,
+}
+
+impl Future<'_> {
+    fn contains(&self, atom: &str) -> bool {
+        self.set.contains(atom) || self.parent.is_some_and(|p| p.contains(atom))
+    }
 }
 
 struct Walker<'a> {
@@ -303,6 +337,10 @@ struct Walker<'a> {
     locals: std::collections::HashSet<String>,
     /// Callee names that terminate the process — a path ends there.
     terminal_calls: &'a [String],
+    /// Cache: statement node id → atom texts tested in the suffix after it.
+    suffix_cache: std::collections::HashMap<usize, std::rc::Rc<std::collections::HashSet<String>>>,
+    /// Walk steps consumed so far (bounded by [`MAX_STEPS`]).
+    steps: usize,
     paths: Vec<(State, String)>,
     incomplete: bool,
 }
@@ -310,14 +348,20 @@ struct Walker<'a> {
 impl Walker<'_> {
     /// Walk `stmts[idx..]`; terminated paths are recorded in `self.paths`,
     /// states that fall off the end are returned for the caller to continue.
+    /// `beyond` carries the conditions tested in enclosing continuations.
     fn walk(
         &mut self,
         stmts: &[tree_sitter::Node],
         idx: usize,
         state: State,
+        beyond: Option<&Future>,
     ) -> Result<Vec<State>, String> {
         if self.paths.len() > MAX_PATHS {
             return Err(format!("more than {MAX_PATHS} paths"));
+        }
+        self.steps += 1;
+        if self.steps > MAX_STEPS {
+            return Err("branch structure too complex to enumerate".to_string());
         }
         let Some(&stmt) = stmts.get(idx) else {
             return Ok(vec![state]);
@@ -365,7 +409,7 @@ impl Walker<'_> {
                         state.writes.insert(name, normalize(&text(value, self.src)));
                     }
                 }
-                self.walk(stmts, idx + 1, state)
+                self.walk(stmts, idx + 1, state, beyond)
             }
             "expression_statement" => {
                 let mut state = state;
@@ -379,7 +423,7 @@ impl Walker<'_> {
                     }
                     self.record_write(*expr, &mut state);
                 }
-                self.walk(stmts, idx + 1, state)
+                self.walk(stmts, idx + 1, state, beyond)
             }
             "if_statement" => {
                 let cond = stmt
@@ -388,36 +432,67 @@ impl Walker<'_> {
                 let then_branch = stmt.child_by_field_name("consequence");
                 let else_branch = stmt.child_by_field_name("alternative");
 
-                let mut fallthroughs = Vec::new();
+                let future = Future {
+                    set: self.suffix_atoms(stmt, stmts, idx + 1),
+                    parent: beyond,
+                };
+
+                let mut ends = Vec::new();
                 for (branch_state, value) in self.eval(cond, state)? {
                     let branch = if value { then_branch } else { else_branch };
-                    let branch_ends = match branch {
+                    match branch {
                         Some(b) => {
                             let branch_stmts = statements_of(b);
-                            self.walk(&branch_stmts, 0, branch_state)?
+                            ends.extend(self.walk(
+                                &branch_stmts,
+                                0,
+                                branch_state,
+                                Some(&future),
+                            )?);
                         }
-                        None => vec![branch_state],
-                    };
-                    for end in branch_ends {
-                        fallthroughs.extend(self.walk(stmts, idx + 1, end)?);
+                        None => ends.push(branch_state),
                     }
+                }
+                // Join: branch ends that cannot behave differently from here
+                // on collapse into one state — this is what keeps long chains
+                // of effect-free conditionals from exploding the path count.
+                let ends = self.merge_states(ends, &future);
+                if ends.len() + self.paths.len() > MAX_PATHS {
+                    return Err(format!("more than {MAX_PATHS} paths"));
+                }
+
+                let mut fallthroughs = Vec::new();
+                for end in ends {
+                    fallthroughs.extend(self.walk(stmts, idx + 1, end, beyond)?);
                 }
                 Ok(fallthroughs)
             }
             "block" => {
+                let future = Future {
+                    set: self.suffix_atoms(stmt, stmts, idx + 1),
+                    parent: beyond,
+                };
                 let inner = named_children(stmt);
                 let mut fallthroughs = Vec::new();
-                for end in self.walk(&inner, 0, state)? {
-                    fallthroughs.extend(self.walk(stmts, idx + 1, end)?);
+                for end in self.walk(&inner, 0, state, Some(&future))? {
+                    fallthroughs.extend(self.walk(stmts, idx + 1, end, beyond)?);
                 }
                 Ok(fallthroughs)
             }
             "switch_expression" | "switch_statement" => {
-                match self.model_switch(stmt, &state)? {
+                let future = Future {
+                    set: self.suffix_atoms(stmt, stmts, idx + 1),
+                    parent: beyond,
+                };
+                match self.model_switch(stmt, &state, &future)? {
                     Some(exits) => {
+                        let exits = self.merge_states(exits, &future);
+                        if exits.len() + self.paths.len() > MAX_PATHS {
+                            return Err(format!("more than {MAX_PATHS} paths"));
+                        }
                         let mut fallthroughs = Vec::new();
                         for end in exits {
-                            fallthroughs.extend(self.walk(stmts, idx + 1, end)?);
+                            fallthroughs.extend(self.walk(stmts, idx + 1, end, beyond)?);
                         }
                         Ok(fallthroughs)
                     }
@@ -427,7 +502,7 @@ impl Walker<'_> {
                         if contains_exit(stmt) {
                             self.incomplete = true;
                         }
-                        self.walk(stmts, idx + 1, state)
+                        self.walk(stmts, idx + 1, state, beyond)
                     }
                 }
             }
@@ -444,9 +519,132 @@ impl Walker<'_> {
                 if contains_exit(stmt) {
                     self.incomplete = true;
                 }
-                self.walk(stmts, idx + 1, state)
+                self.walk(stmts, idx + 1, state, beyond)
             }
-            _ => self.walk(stmts, idx + 1, state),
+            _ => self.walk(stmts, idx + 1, state, beyond),
+        }
+    }
+
+    /// Atom texts tested anywhere in `stmts[from..]` (cached per statement).
+    fn suffix_atoms(
+        &mut self,
+        stmt: tree_sitter::Node,
+        stmts: &[tree_sitter::Node],
+        from: usize,
+    ) -> std::rc::Rc<std::collections::HashSet<String>> {
+        if let Some(cached) = self.suffix_cache.get(&stmt.id()) {
+            return cached.clone();
+        }
+        let mut set = std::collections::HashSet::new();
+        for s in &stmts[from..] {
+            collect_condition_texts(*s, self.src, &mut set);
+        }
+        let set = std::rc::Rc::new(set);
+        self.suffix_cache.insert(stmt.id(), set.clone());
+        set
+    }
+
+    /// Collapse join states that cannot behave differently from here on:
+    /// exact duplicates merge, and two states identical except for one
+    /// condition atom that is never tested again merge with that atom
+    /// dropped (both halves of its cube are present, so the merged row's
+    /// `Any` is sound). Runs to fixpoint.
+    fn merge_states(&self, states: Vec<State>, future: &Future) -> Vec<State> {
+        use std::collections::HashMap;
+
+        // States can only merge if they have identical observable effects, so
+        // partition by (writes, calls) and merge condition cubes within each.
+        type Effects = (
+            std::collections::BTreeMap<String, String>,
+            std::collections::BTreeSet<String>,
+        );
+        let mut groups: HashMap<Effects, Vec<Conds>> = HashMap::new();
+        for mut s in states {
+            s.conds.sort_unstable();
+            s.conds.dedup();
+            groups.entry((s.writes, s.calls)).or_default().push(s.conds);
+        }
+
+        let mut out = Vec::new();
+        for ((writes, calls), cubes) in groups {
+            for conds in self.merge_cubes(cubes, future) {
+                out.push(State {
+                    conds,
+                    writes: writes.clone(),
+                    calls: calls.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Quine-McCluskey-style cube combining over condition vectors that share
+    /// the same observable effects. Two cubes differing in exactly one literal
+    /// — whose atom is never tested again — merge with that literal dropped
+    /// (both halves of its value are present, so the merge is sound). Runs to
+    /// fixpoint; hash-keyed, so cost is `O(cubes × literals)` per round.
+    fn merge_cubes(&self, cubes: Vec<Conds>, future: &Future) -> Vec<Conds> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut current: HashSet<Conds> = cubes.into_iter().collect();
+        loop {
+            // Key = a cube with one mergeable literal removed; collect the
+            // removed (atom, value) from every cube that reduces to it.
+            let mut sigs: HashMap<Conds, Vec<(usize, bool, Conds)>> = HashMap::new();
+            for cube in &current {
+                for k in 0..cube.len() {
+                    let (atom, val) = cube[k];
+                    if future.contains(&self.atoms[atom]) {
+                        continue;
+                    }
+                    let mut reduced = cube.clone();
+                    reduced.remove(k);
+                    sigs.entry(reduced)
+                        .or_default()
+                        .push((atom, val, cube.clone()));
+                }
+            }
+
+            let mut next: HashSet<Conds> = HashSet::new();
+            let mut consumed: HashSet<Conds> = HashSet::new();
+            for (reduced, entries) in sigs {
+                // Within one reduced signature, an atom that appears both T and
+                // F means its two cubes (reduced ∪ {atom=T/F}) merge to reduced.
+                let mut by_atom: HashMap<usize, (bool, bool)> = HashMap::new();
+                for (atom, val, _) in &entries {
+                    let e = by_atom.entry(*atom).or_insert((false, false));
+                    if *val {
+                        e.0 = true;
+                    } else {
+                        e.1 = true;
+                    }
+                }
+                let mut merged_here = false;
+                for (atom, val, cube) in &entries {
+                    let (t, f) = by_atom[atom];
+                    if t && f {
+                        // Only the cubes whose removed atom actually pairs up
+                        // are consumed; others reached `reduced` via a
+                        // different (non-pairing) atom and must survive.
+                        let _ = val;
+                        consumed.insert(cube.clone());
+                        merged_here = true;
+                    }
+                }
+                if merged_here {
+                    next.insert(reduced.clone());
+                }
+            }
+
+            if consumed.is_empty() {
+                return current.into_iter().collect();
+            }
+            for cube in current {
+                if !consumed.contains(&cube) {
+                    next.insert(cube);
+                }
+            }
+            current = next;
         }
     }
 
@@ -642,6 +840,7 @@ impl Walker<'_> {
         &mut self,
         node: tree_sitter::Node,
         state: &State,
+        future: &Future,
     ) -> Result<Option<Vec<State>>, String> {
         let Some(cond) = node.child_by_field_name("condition") else {
             return Ok(None);
@@ -757,7 +956,7 @@ impl Walker<'_> {
                     }
                 }
                 if feasible && self.assign_atom(label, true, &mut branch)? {
-                    exits.extend(self.walk(&stmts, 0, branch)?);
+                    exits.extend(self.walk(&stmts, 0, branch, Some(future))?);
                 }
                 seen.push(value);
             }
@@ -776,7 +975,7 @@ impl Walker<'_> {
             match default_group {
                 Some(gi) => {
                     let (_, _, stmts) = groups[gi].clone();
-                    exits.extend(self.walk(&stmts, 0, fallback)?);
+                    exits.extend(self.walk(&stmts, 0, fallback, Some(future))?);
                 }
                 None => exits.push(fallback),
             }
@@ -800,6 +999,88 @@ const LOGGING_PREFIXES: &[&str] = &[
 
 fn is_logging_call(call: &str) -> bool {
     LOGGING_PREFIXES.iter().any(|p| call.starts_with(p))
+}
+
+/// Collect the atom texts a subtree can test, mirroring the walker's
+/// atomization (if-conditions decomposed through parens/`!`/`&&`/`||`,
+/// switch subjects as `subject == value` labels). Over-inclusion is safe —
+/// it only prevents a merge.
+fn collect_condition_texts(
+    node: tree_sitter::Node,
+    src: &[u8],
+    out: &mut std::collections::HashSet<String>,
+) {
+    fn leaves(expr: tree_sitter::Node, src: &[u8], out: &mut std::collections::HashSet<String>) {
+        match expr.kind() {
+            "parenthesized_expression" => {
+                if let Some(inner) = named_children(expr).first() {
+                    leaves(*inner, src, out);
+                }
+            }
+            "unary_expression" => {
+                if let Some(operand) = expr.child_by_field_name("operand") {
+                    leaves(operand, src, out);
+                }
+            }
+            "binary_expression" => {
+                let op = expr
+                    .child_by_field_name("operator")
+                    .map(|n| text(n, src))
+                    .unwrap_or_default();
+                if op == "&&" || op == "||" {
+                    if let Some(l) = expr.child_by_field_name("left") {
+                        leaves(l, src, out);
+                    }
+                    if let Some(r) = expr.child_by_field_name("right") {
+                        leaves(r, src, out);
+                    }
+                } else {
+                    out.insert(normalize(&text(expr, src)));
+                }
+            }
+            "true" | "false" => {}
+            _ => {
+                out.insert(normalize(&text(expr, src)));
+            }
+        }
+    }
+
+    match node.kind() {
+        "if_statement" => {
+            if let Some(cond) = node.child_by_field_name("condition") {
+                leaves(cond, src, out);
+            }
+        }
+        "switch_expression" | "switch_statement" => {
+            if let Some(cond) = node.child_by_field_name("condition") {
+                let subject = normalize(text(cond, src).trim_matches(['(', ')']));
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    let labels: Vec<_> = body.children(&mut cursor).collect();
+                    for child in labels {
+                        let mut inner = child.walk();
+                        let parts: Vec<_> = child.children(&mut inner).collect();
+                        for part in parts {
+                            if part.kind() == "switch_label" {
+                                for e in named_children(part) {
+                                    out.insert(format!(
+                                        "{subject} == {}",
+                                        normalize(&text(e, src))
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    for child in children {
+        collect_condition_texts(child, src, out);
+    }
 }
 
 /// Count `break` statements binding to the enclosing switch (not descending
@@ -1079,7 +1360,7 @@ mod tests {
 
     #[test]
     fn too_many_atoms_is_skipped_with_reason() {
-        let conditions: String = (0..17)
+        let conditions: String = (0..65)
             .map(|i| format!("if (c{i}) {{ return {i}; }}\n"))
             .collect();
         let java = format!("class A {{ int m() {{ {conditions} return -1; }} }}");
@@ -1088,6 +1369,87 @@ mod tests {
         assert_eq!(e.skipped.len(), 1);
         assert!(e.skipped[0].0.ends_with("A.m"));
         assert!(e.skipped[0].1.contains("distinct conditions"));
+    }
+
+    #[test]
+    fn effect_free_conditional_chains_do_not_explode() {
+        // 30 sequential log-only ifs would be 2^30 paths without state
+        // merging; with it the join collapses every fork.
+        let conditions: String = (0..30)
+            .map(|i| format!("if (c{i}) {{ logger.info(\"x\"); }}\n"))
+            .collect();
+        let java = format!("class A {{ String m() {{ {conditions} return \"ok\"; }} }}");
+        let mut e = extract(&java);
+        assert_eq!(e.methods.len(), 1, "skipped: {:?}", e.skipped);
+        let m = e.methods.remove(0);
+        assert_eq!(m.table.rows().len(), 1, "{:?}", m.table.rows());
+        let c = compress(&m.table).unwrap();
+        assert_eq!(c.dead_variables.len(), 30);
+    }
+
+    #[test]
+    fn merge_respects_later_reuse_of_the_condition() {
+        // The first `if (a)` is effect-free, but `a` is tested again later:
+        // merging would forge infeasible rows, so it must not happen.
+        let m = single(
+            r#"
+            class A {
+                int m(boolean a) {
+                    if (a) { logger.info("seen"); }
+                    if (a) { return 1; }
+                    return 2;
+                }
+            }
+            "#,
+        );
+        let one = m
+            .table
+            .rows()
+            .iter()
+            .find(|r| r.outcome == "return 1")
+            .unwrap();
+        assert_eq!(one.inputs, vec![Tri::True]);
+        let two = m
+            .table
+            .rows()
+            .iter()
+            .find(|r| r.outcome == "return 2")
+            .unwrap();
+        assert_eq!(two.inputs, vec![Tri::False]);
+    }
+
+    #[test]
+    fn merge_respects_differing_writes() {
+        // Branches with different field writes must stay separate paths.
+        let m = single(
+            r#"
+            class A {
+                void m(boolean c) {
+                    if (c) { this.x = 1; } else { this.x = 2; }
+                }
+            }
+            "#,
+        );
+        assert_eq!(m.table.rows().len(), 2);
+        let c = compress(&m.table).unwrap();
+        assert!(c.dead_variables.is_empty());
+    }
+
+    #[test]
+    fn wide_method_compresses_via_heuristic() {
+        // 20 sequential guard clauses — past the exact-QM limit, but the
+        // cube heuristic handles it: each guard becomes one rule.
+        let conditions: String = (0..20)
+            .map(|i| format!("if (c{i}) {{ return {i}; }}\n"))
+            .collect();
+        let java = format!("class A {{ int m() {{ {conditions} return -1; }} }}");
+        let mut e = extract(&java);
+        assert_eq!(e.methods.len(), 1, "skipped: {:?}", e.skipped);
+        let m = e.methods.remove(0);
+        assert_eq!(m.table.variables().len(), 20);
+        let c = compress(&m.table).unwrap();
+        assert_eq!(c.rules.len(), 21); // 20 guards + fall-through default
+        assert!(c.dead_variables.is_empty());
     }
 
     #[test]
