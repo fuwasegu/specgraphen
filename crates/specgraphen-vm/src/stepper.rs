@@ -351,8 +351,20 @@ impl<'a> Stepper<'a> {
         self.advance(); // past the loop; every world resumes after it
         let body = stmt.child_by_field_name("body").map(statements_of);
 
+        // Entering the body binds a `for (T v : …)` loop variable to a fresh
+        // element, so any condition atom pinned on `v` from an outer scope is
+        // no longer valid inside the body.
+        let mut entered = self.state.clone();
+        if stmt.kind() == "enhanced_for_statement" {
+            if let Some(name) = stmt.child_by_field_name("name") {
+                let var = sym::normalize(&sym::text(name, self.src));
+                sym::invalidate(&mut entered, &self.atoms, &var);
+            }
+        }
+
         if !skippable {
             // do-while: body always runs once; no branch needed.
+            self.state = entered;
             if let Some(body) = body {
                 self.stack.push(Frame {
                     stmts: body,
@@ -366,7 +378,7 @@ impl<'a> Stepper<'a> {
         self.pending = vec![
             Pending {
                 label: "loop body (1 iteration)".to_string(),
-                state: self.state.clone(),
+                state: entered,
                 body,
             },
             Pending {
@@ -1043,6 +1055,82 @@ mod tests {
             "reassigned x must let the re-test fork: {stop:?}"
         );
         assert_eq!(stop.branches.len(), 2);
+    }
+
+    #[test]
+    fn reassign_inside_loop_body_reforks_equals() {
+        // Outer test pins s.equals("X")=true; the re-scan loop body reassigns
+        // s, so the inner re-test must re-fork (not follow the stale pin).
+        let src = r#"class A { String m(String s, java.util.List<String> xs) {
+            if (s.equals("X")) {
+                for (String e : xs) {
+                    s = e;
+                    if (!s.equals("X")) { return "moved"; }
+                }
+                return "after";
+            }
+            return "other";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // if s.equals("X")
+        let t = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("{true}"))
+            .unwrap();
+        s.choose(t).unwrap();
+        let stop = s.step().unwrap(); // for-each → loop branch
+        let enter = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("1 iteration"))
+            .unwrap();
+        s.choose(enter).unwrap();
+        s.step().unwrap(); // s = e  → invalidates s.equals("X")
+        let stop = s.step().unwrap(); // if (!s.equals("X")) → must re-fork
+        assert_eq!(
+            stop.kind,
+            StopKind::Branch,
+            "reassigned s must re-fork: {stop:?}"
+        );
+    }
+
+    #[test]
+    fn foreach_loop_variable_rebind_reforks_equals() {
+        // The loop VARIABLE shares the name of an outer-pinned subject. Entering
+        // the body rebinds it, so a pinned `code.equals("X")` from outside must
+        // not force the in-body re-test (this was the residual "C" case).
+        let src = r#"class A { String m(String code, java.util.List<String> codes) {
+            if (code.equals("X")) {
+                for (String code : codes) {
+                    if (!code.equals("X")) { return "diff"; }
+                }
+            }
+            return "done";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // if code.equals("X")
+        let t = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("{true}"))
+            .unwrap();
+        s.choose(t).unwrap();
+        let stop = s.step().unwrap(); // for-each → loop branch
+        let enter = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("1 iteration"))
+            .unwrap();
+        s.choose(enter).unwrap(); // entering rebinds `code` → pin invalidated
+        let stop = s.step().unwrap(); // if (!code.equals("X")) → must re-fork
+        assert_eq!(
+            stop.kind,
+            StopKind::Branch,
+            "loop-var `code` rebound; re-test must re-fork, not follow stale pin: {stop:?}"
+        );
     }
 
     #[test]

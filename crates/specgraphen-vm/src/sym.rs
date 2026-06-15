@@ -307,8 +307,9 @@ pub fn bind_local(name: &str, value: &str, atoms: &AtomTable, state: &mut SymSta
 }
 
 /// Drop condition atoms whose label textually references variable `var` — their
-/// pinned value is no longer trustworthy after `var` was written.
-fn invalidate(state: &mut SymState, atoms: &AtomTable, var: &str) {
+/// pinned value is no longer trustworthy after `var` was written or rebound
+/// (e.g. a `for (T var : …)` loop variable taking a new element each iteration).
+pub fn invalidate(state: &mut SymState, atoms: &AtomTable, var: &str) {
     state
         .conds
         .retain(|(id, _)| !references(atoms.name(*id), var));

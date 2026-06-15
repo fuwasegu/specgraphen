@@ -22,6 +22,7 @@ pub mod sym;
 
 pub use stepper::{Frame, Stepper, Stop, StopKind};
 pub use sym::{
-    bind_local, is_logging_call, is_terminal_call, named_children, normalize, parse_switch,
-    record_write, text, AtomTable, Evaluator, SwitchGroup, SwitchModel, SymError, SymState,
+    bind_local, invalidate, is_logging_call, is_terminal_call, named_children, normalize,
+    parse_switch, record_write, text, AtomTable, Evaluator, SwitchGroup, SwitchModel, SymError,
+    SymState,
 };
