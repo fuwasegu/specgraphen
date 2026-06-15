@@ -195,6 +195,24 @@ impl Evaluator<'_> {
             return Ok(vec![(state, value)]);
         }
 
+        // Mutual exclusion: `X.equals(c1)` / `X == c1` is false if a sibling
+        // `X.equals(c2)` / `X == c2` (different constant) is already pinned
+        // true — a value can't equal two distinct constants. Without this the
+        // two equals-predicates are independent booleans and an UNSAT path
+        // (`X=="0"` ∧ `X=="3"`) can form, mis-resolving a later `||` over them.
+        if let Some((subj, c1)) = equality_constant(&label) {
+            let contradicted = state.conds.iter().any(|&(a, v)| {
+                v && a != id
+                    && equality_constant(self.atoms.name(a))
+                        .is_some_and(|(s2, c2)| s2 == subj && c2 != c1)
+            });
+            if contradicted {
+                let mut st = state;
+                st.conds.push((id, false));
+                return Ok(vec![(st, false)]);
+            }
+        }
+
         let mut true_state = state.clone();
         true_state.conds.push((id, true));
         let mut false_state = state;
@@ -294,6 +312,44 @@ fn invalidate(state: &mut SymState, atoms: &AtomTable, var: &str) {
     state
         .conds
         .retain(|(id, _)| !references(atoms.name(*id), var));
+}
+
+/// Recognize an equality-against-constant atom: `SUBJ.equals(LIT)`,
+/// `SUBJ == LIT`, or `LIT == SUBJ` where LIT is a string/char/number literal.
+/// Returns `(subject, literal)`. Used to enforce that one subject can't equal
+/// two distinct constants at once.
+fn equality_constant(label: &str) -> Option<(&str, &str)> {
+    if let Some(idx) = label.find(".equals(") {
+        if let Some(arg) = label[idx + ".equals(".len()..].strip_suffix(')') {
+            let subject = &label[..idx];
+            if !subject.is_empty() && is_literal(arg) {
+                return Some((subject, arg));
+            }
+        }
+    }
+    if let Some(idx) = label.find("==") {
+        let lhs = label[..idx].trim();
+        let rhs = label[idx + 2..].trim();
+        if !lhs.is_empty() && !rhs.is_empty() {
+            if is_literal(rhs) && !is_literal(lhs) {
+                return Some((lhs, rhs));
+            }
+            if is_literal(lhs) && !is_literal(rhs) {
+                return Some((rhs, lhs));
+            }
+        }
+    }
+    None
+}
+
+/// A string/char/number literal token (heuristic, on normalized text).
+fn is_literal(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with('"')
+        || s.starts_with('\'')
+        || s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || c == '-')
 }
 
 /// Does `label` mention `var` as a whole identifier token? `.` counts as a
@@ -587,6 +643,34 @@ mod tests {
         let false_paths: Vec<_> = r.iter().filter(|(_, v)| !*v).collect();
         // a=false (b unconstrained) and a=true,b=false
         assert!(false_paths.iter().any(|(s, _)| s.conds == vec![(0, false)]));
+    }
+
+    #[test]
+    fn distinct_equals_constants_are_mutually_exclusive() {
+        // s.equals("A") true ⇒ s.equals("B") is false (a value can't be both).
+        let wrapped = r#"class A { void m(String s) { if (s.equals("A") || s.equals("B")) {} } }"#;
+        let tree = parse(wrapped);
+        let bytes = wrapped.as_bytes();
+        let cond = find(tree.root_node(), "if_statement")
+            .unwrap()
+            .child_by_field_name("condition")
+            .unwrap();
+        let inner = named_children(cond);
+        let or = inner.first().copied().unwrap_or(cond);
+        let mut atoms = AtomTable::new(16);
+        let mut ev = Evaluator {
+            src: bytes,
+            atoms: &mut atoms,
+        };
+        let results = ev.eval(or, SymState::default()).unwrap();
+        // No world may pin both equals("A") and equals("B") true.
+        let a = atoms.id_of("s.equals(\"A\")");
+        let b = atoms.id_of("s.equals(\"B\")");
+        for (state, _) in &results {
+            let a_true = a.is_some_and(|id| state.conds.contains(&(id, true)));
+            let b_true = b.is_some_and(|id| state.conds.contains(&(id, true)));
+            assert!(!(a_true && b_true), "UNSAT world: s == A and s == B");
+        }
     }
 
     #[test]

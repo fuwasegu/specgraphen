@@ -1573,6 +1573,32 @@ mod tests {
     }
 
     #[test]
+    fn same_subject_equals_constants_never_both_true() {
+        // s.equals("A") and s.equals("B") are mutually exclusive: no extracted
+        // row may pin both true (that combination is UNSAT).
+        let m = single(
+            r#"
+            class A {
+                int m(String s) {
+                    if (s.equals("A")) { return 1; }
+                    if (s.equals("B")) { return 2; }
+                    return 0;
+                }
+            }
+            "#,
+        );
+        let vars = m.table.variables();
+        let a = vars.iter().position(|v| v.contains("\"A\"")).unwrap();
+        let b = vars.iter().position(|v| v.contains("\"B\"")).unwrap();
+        for row in m.table.rows() {
+            assert!(
+                !(row.inputs[a] == Tri::True && row.inputs[b] == Tri::True),
+                "UNSAT row pins both s==A and s==B: {row:?}"
+            );
+        }
+    }
+
+    #[test]
     fn extracted_table_round_trips_through_compress() {
         // End-to-end: legacy-looking method where one flag is patch noise
         let m = single(
