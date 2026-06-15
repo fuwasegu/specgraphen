@@ -167,6 +167,12 @@ impl<'a> Stepper<'a> {
         !self.pending.is_empty()
     }
 
+    /// The branch world-lines currently on offer (empty unless paused).
+    /// Read-only — does not advance.
+    pub fn peek_branches(&self) -> Vec<String> {
+        self.pending.iter().map(|p| p.label.clone()).collect()
+    }
+
     fn snapshot(&mut self) {
         self.history.push(Snapshot {
             stack: self.stack.clone(),

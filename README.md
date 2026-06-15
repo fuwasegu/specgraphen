@@ -100,7 +100,7 @@ Just ask naturally:
 - "What are the columns of the Customer table and where are they used?"
 - "Explain the createUser method"
 
-## 20 MCP Tools
+## 21 MCP Tools
 
 ### Project-wide
 
@@ -141,6 +141,7 @@ Just ask naturally:
 | `hotspots` | Methods ranked by approximate cyclomatic complexity (refactoring triage) |
 | `crud_matrix` | Entry-point × table CRUD matrix from SQL, mapper XML, and repository conventions |
 | `extract_core_rules` | Minimal decision table for a method's branching logic (Quine-McCluskey); flags dead conditions |
+| `debug_trace` | Runtime-less interactive symbolic stepping: replay branch choices, inspect variables/path-conditions, choose world lines — agent-drivable, no runtime |
 | `export_spec` | Markdown specification built from structure + accumulated annotations |
 
 ### Enrich flow (Claude Code as LLM)
@@ -177,11 +178,13 @@ Falls back to tree-sitter heuristics when LSP is unavailable.
 ## Architecture
 
 ```
-specgraphen-cli          CLI binary (lift / query / serve / export)
-specgraphen-mcp          MCP server (stdio JSON-RPC, 20 tools)
+specgraphen-cli          CLI binary (lift / query / serve / export / rules)
+specgraphen-mcp          MCP server (stdio JSON-RPC, 21 tools)
 specgraphen-query         Query engine + projection
 specgraphen-lift          tree-sitter Java parser → HG Space
 specgraphen-resolver      TypeResolver trait (LSP / heuristic / chain)
+specgraphen-logic         Boolean decision-table compression (Quine-McCluskey / cube)
+specgraphen-vm            Resumable symbolic stepper (shared by extraction + debug_trace)
 specgraphen-corroboration Multi-derivation fusion (HG Bayesian + Correspondence)
 specgraphen-invariant     Structural checks (HG reachable + cycle detection)
 specgraphen-model         Domain types (JavaEntityType, SpaceData)
@@ -215,7 +218,7 @@ specgraphen は:
 
 1. コードベース全体を事前解析（tree-sitter + オプションで LSP）して構造化グラフに変換
 2. エンティティ・関係・根拠を Higher Graphen Space に格納
-3. MCP 経由で 20 種類のクエリツールを提供 — 1回の問い合わせ、サブ秒で応答
+3. MCP 経由で 21 種類のクエリツールを提供 — 1回の問い合わせ、サブ秒で応答
 
 > **設計として Java に寄せています。** specgraphen の照準はレガシーエンタープライズのコードベースで、パース・LSP 統合（jdtls）・解析ヒューリスティックは Java とその周辺（Shift_JIS/EUC-JP ソース、MyBatis mapper XML、SQL、JSP/JSTL の画面ロジック）向けに作られ、実案件で検証されています。数理コア（`specgraphen-logic`）とグラフ基盤は言語非依存なので他言語はフロントエンド追加で対応可能ですが、現時点で実用になるのは Java です。
 
@@ -293,7 +296,7 @@ LSP を使うと型厳密なシンボル解決が可能に:
 
 LSP が使えない環境では tree-sitter ヒューリスティックに自動フォールバック。
 
-## 20 の MCP ツール
+## 21 の MCP ツール
 
 | カテゴリ | ツール | 説明 |
 |---|---|---|
@@ -312,6 +315,7 @@ LSP が使えない環境では tree-sitter ヒューリスティックに自動
 | レガシー | `hotspots` | 複雑度によるメソッドランキング（リファクタ優先度） |
 | レガシー | `crud_matrix` | エントリポイント × テーブルの CRUD マトリクス |
 | レガシー | `extract_core_rules` | 分岐ロジックを最小ディシジョンテーブルに圧縮（不要条件を数学的に特定） |
+| レガシー | `debug_trace` | ランタイムレスの対話的シンボリックステップ実行（分岐選択を再生、変数・経路条件を観察） |
 | レガシー | `export_spec` | 構造 + 注釈から Markdown 仕様書を生成 |
 | 学習 | `enrich` | ソースコード + コンテキストを返す |
 | 学習 | `enrich_batch` | 未分析エンティティの一括取得 |

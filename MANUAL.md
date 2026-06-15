@@ -20,7 +20,7 @@ specgraphen は「事前に全ファイルを解析して構造化データを�
 
 ② serve（MCP サーバ起動）
    保存された Space を読み込み、MCP サーバとして待機
-   → Claude Code から 20 種類のクエリを受け付ける
+   → Claude Code から 21 種類のクエリを受け付ける
 
 ③ Claude Code が使う
    ユーザーが「注文機能の仕様を教えて」と聞く
@@ -72,11 +72,11 @@ Shift-JIS / EUC-JP のレガシー Java コードも自動判定して読める�
 
 **serve = lift で作った構造化データを MCP サーバとして公開する処理。**
 
-Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると、Claude Code 起動時に自動で specgraphen サーバが立ち上がる。以後、Claude Code は 20 種類のツールでコードの情報を取得できる。
+Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると、Claude Code 起動時に自動で specgraphen サーバが立ち上がる。以後、Claude Code は 21 種類のツールでコードの情報を取得できる。
 
 ---
 
-## 20 のツール一覧
+## 21 のツール一覧
 
 ### 全体を見る
 
@@ -118,6 +118,7 @@ Claude Code の設定（`.claude.json` または `mcp.json`）に登録すると
 | **crud_matrix** | エントリポイント × テーブルの CRUD マトリクス。SQL 文・MyBatis mapper XML・リポジトリ命名規約から導出 | 「どの処理がどのテーブルを更新してる？」 |
 | **export_spec** | 構造 + 蓄積した注釈から Markdown 仕様書を生成 | 「仕様書を出力して」 |
 | **extract_core_rules** | メソッドの分岐ロジックを Quine-McCluskey で極小ディシジョンテーブルに圧縮。結果に影響しない条件（パッチ残骸）を dead variables として特定。`--source-root` 必須 | 「このメソッドの本当の仕様は？」 |
+| **debug_trace** | ランタイムレスの対話的シンボリックステップ実行。分岐選択の配列を再生し、実行した文・仮想変数・経路条件（Context Rules）・コールスタックと、次の分岐 or 結果を返す。セッションはステートレス（choices 配列のみ。undo=末尾削除）。AI が選択空間を DFS して全挙動を列挙できる。`--source-root` 必須 | 「この分岐に入ったら何が起きる？」 |
 
 `dead_code` と `crud_matrix` は静的解析の限界（リフレクション、DI、未解決参照）を確信度と note で明示する。`unknowns` と組み合わせて解析の抜けを確認できる。
 
@@ -222,7 +223,7 @@ specgraphen export --space-id myproject --store /path/to/.specgraphen --out SPEC
                            │
               ┌────────────▼────────────┐
               │     Query Engine        │
-              │  20 ツール + Projection  │
+              │  21 ツール + Projection  │
               └────────────┬────────────┘
                            │
          ┌─────────────────▼─────────────────┐
@@ -237,7 +238,7 @@ specgraphen export --space-id myproject --store /path/to/.specgraphen --out SPEC
     └──────────┴───────────────────────┴──────────┘
 ```
 
-### 11 クレート
+### 12 クレート
 
 | クレート | 役割 |
 |---|---|
@@ -245,10 +246,11 @@ specgraphen export --space-id myproject --store /path/to/.specgraphen --out SPEC
 | `specgraphen-lift` | tree-sitter で Java をパース → HG Space に変換 |
 | `specgraphen-resolver` | TypeResolver trait。LSP (jdtls) / heuristic / chain fallback |
 | `specgraphen-logic` | 純粋ブール代数のディシジョンテーブル圧縮（Quine-McCluskey）。依存ゼロ |
+| `specgraphen-vm` | レジューム可能シンボリックステッパー + 共有シンボリック実行意味論（tree-sitter のみ）。バッチ抽出と対話ステップの共通コア |
 | `specgraphen-llm` | LLM 抽象化。Claude API / OpenAI 互換 |
 | `specgraphen-corroboration` | 多重導出コロボレーション。HG Bayesian Confidence + Correspondence + Gluing |
 | `specgraphen-invariant` | 構造検査。HG reachable() + find_simple_cycles() |
-| `specgraphen-query` | 20 ツールのクエリエンジン |
+| `specgraphen-query` | 21 ツールのクエリエンジン |
 | `specgraphen-store` | JSON ファイル永続化 |
 | `specgraphen-mcp` | MCP サーバ（stdio JSON-RPC） |
 | `specgraphen-cli` | CLI バイナリ（lift / query / serve / export） |

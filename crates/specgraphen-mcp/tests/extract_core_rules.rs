@@ -93,4 +93,48 @@ fn tool_is_listed() {
     .to_string();
     let response = server.handle_request_line(&request);
     assert!(response.contains("extract_core_rules"), "{response}");
+    assert!(response.contains("debug_trace"), "{response}");
+}
+
+fn call_debug(server: &SpecGraphenServer, symbol: &str, choices: &[usize]) -> String {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "debug_trace",
+            "arguments": { "symbol": symbol, "choices": choices }
+        }
+    })
+    .to_string();
+    let response = server.handle_request_line(&request);
+    let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert!(
+        v.get("error").is_none(),
+        "tool returned error: {}",
+        v["error"]
+    );
+    v["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn debug_trace_pauses_at_branch_then_resolves() {
+    let server = server();
+
+    // First call: run to the first branch.
+    let start = call_debug(&server, "UserService.createUser", &[]);
+    assert!(start.contains("Debug trace"), "{start}");
+    assert!(start.contains("Paused at a branch"), "{start}");
+    // branch options are indexed
+    assert!(start.contains("- 0:"), "{start}");
+
+    // Choosing a world line advances and reports Context Rules or an outcome.
+    let next = call_debug(&server, "UserService.createUser", &[0]);
+    assert!(
+        next.contains("Context Rules") || next.contains("Terminated"),
+        "{next}"
+    );
 }

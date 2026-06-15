@@ -406,6 +406,30 @@ impl SpecGraphenServer {
                         },
                         "required": ["symbol"]
                     }
+                },
+                {
+                    "name": "debug_trace",
+                    "description": "Runtime-less interactive symbolic stepping of a method. Replays a list of branch choices and reports what executed, the current symbolic variable values and path conditions ('Context Rules'), the call stack, and either the next branch to choose or the outcome. The session is stateless: pass the growing `choices` array each call (undo = drop the last; time-travel = truncate). Start with choices=[] to reach the first branch, then append a branch index to explore a world line. An agent can DFS the choice space to enumerate every behavior. No runtime, no side effects. Requires the server to be started with --source-root.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {
+                                "type": "string",
+                                "description": "Method FQN (partial suffix match supported, e.g. 'UserService.createUser')"
+                            },
+                            "choices": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "Branch indices chosen so far, in order. Each index selects one world-line from the branches reported by the previous call. Empty = run to the first branch."
+                            },
+                            "terminal_calls": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Method names that terminate the process like System.exit (legacy error-exit helpers)."
+                            }
+                        },
+                        "required": ["symbol"]
+                    }
                 }
             ]
         }))
@@ -663,12 +687,115 @@ impl SpecGraphenServer {
                     .unwrap_or_default();
                 self.extract_core_rules(symbol, terminal_calls)?
             }
+            "debug_trace" => {
+                let symbol = arguments["symbol"]
+                    .as_str()
+                    .ok_or((-32602, "Missing symbol argument".to_string()))?;
+                let choices: Vec<usize> = arguments["choices"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let terminal_calls: Vec<String> = arguments["terminal_calls"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.debug_trace(symbol, &choices, &terminal_calls)?
+            }
             _ => return Err((-32602, format!("Unknown tool: {tool_name}"))),
         };
 
         Ok(serde_json::json!({
             "content": [{"type": "text", "text": result_text}]
         }))
+    }
+
+    fn debug_trace(
+        &self,
+        symbol: &str,
+        choices: &[usize],
+        terminal_calls: &[String],
+    ) -> Result<String, (i32, String)> {
+        let (fqn, file, line) = self
+            .query_engine
+            .witness_of(symbol)
+            .ok_or((-32000, format!("Symbol not found: {symbol}")))?;
+        let source = self.query_engine.file_source(&file).ok_or((
+            -32000,
+            format!(
+                "Source for {file} is not loaded. Start the server with \
+                 --source-root pointing at the Java source tree."
+            ),
+        ))?;
+
+        let result = specgraphen_lift::trace(source, line, choices, terminal_calls)
+            .map_err(|e| (-32000, format!("Trace failed: {e}")))?;
+
+        let mut out = String::new();
+        out.push_str(&format!("# Debug trace: {fqn} ({file}:{line})\n\n"));
+        if !choices.is_empty() {
+            out.push_str(&format!("Choices replayed: {choices:?}\n\n"));
+        }
+
+        out.push_str("## Executed\n");
+        if result.executed.is_empty() {
+            out.push_str("(nothing — already at a branch or the start)\n");
+        } else {
+            for step in &result.executed {
+                out.push_str(&format!("- L{}  {}\n", step.line, step.text));
+            }
+        }
+
+        out.push_str("\n## State\n");
+        out.push_str(&format!(
+            "- Call stack: {}\n",
+            result.call_stack.join(" › ")
+        ));
+        if result.variables.is_empty() {
+            out.push_str("- Variables: (none)\n");
+        } else {
+            let vars: Vec<String> = result
+                .variables
+                .iter()
+                .map(|(k, v)| format!("{k} = {v}"))
+                .collect();
+            out.push_str(&format!("- Variables: {}\n", vars.join(", ")));
+        }
+        if result.context_rules.is_empty() {
+            out.push_str("- Context Rules: (none — no branch taken)\n");
+        } else {
+            out.push_str(&format!(
+                "- Context Rules: {}\n",
+                result.context_rules.join(" ∧ ")
+            ));
+        }
+
+        out.push_str("\n## Status\n");
+        match result.status {
+            specgraphen_lift::TraceStatus::AwaitingChoice { branches } => {
+                out.push_str("Paused at a branch — choose a world line by appending its index to `choices`:\n");
+                for (i, b) in branches.iter().enumerate() {
+                    out.push_str(&format!("- {i}: {b}\n"));
+                }
+            }
+            specgraphen_lift::TraceStatus::Terminated { outcome } => {
+                out.push_str(&format!("Terminated → {outcome}\n"));
+            }
+            specgraphen_lift::TraceStatus::FallThrough => {
+                out.push_str("Fell through to the end of the method (no explicit return).\n");
+            }
+            specgraphen_lift::TraceStatus::StepCap => {
+                out.push_str("Hit the step cap before reaching a branch or end (method too large to trace in one call).\n");
+            }
+        }
+        Ok(out)
     }
 
     fn extract_core_rules(
