@@ -686,110 +686,19 @@ impl Walker<'_> {
         state: &State,
         future: &Future,
     ) -> Result<Option<Vec<State>>, String> {
-        let Some(cond) = node.child_by_field_name("condition") else {
+        let Some(model) = sym::parse_switch(node, self.src) else {
             return Ok(None);
         };
-        let subject = normalize(text(cond, self.src).trim_matches(['(', ')']));
-        let Some(body) = node.child_by_field_name("body") else {
-            return Ok(None);
-        };
-
-        // Phase 1: collect raw groups (case values — empty = default,
-        // statements including any trailing break, arrow-style flag).
-        struct RawGroup<'t> {
-            values: Vec<String>,
-            is_default: bool,
-            stmts: Vec<tree_sitter::Node<'t>>,
-            is_rule: bool,
-        }
-        let mut raw: Vec<RawGroup> = Vec::new();
-        for child in named_children(body) {
-            match child.kind() {
-                "switch_block_statement_group" | "switch_rule" => {
-                    let mut group = RawGroup {
-                        values: Vec::new(),
-                        is_default: false,
-                        stmts: Vec::new(),
-                        is_rule: child.kind() == "switch_rule",
-                    };
-                    for part in named_children(child) {
-                        if part.kind() == "switch_label" {
-                            let exprs = named_children(part);
-                            if exprs.is_empty() {
-                                group.is_default = true; // `default:`
-                            }
-                            for e in exprs {
-                                group.values.push(normalize(&text(e, self.src)));
-                            }
-                        } else {
-                            group.stmts.push(part);
-                        }
-                    }
-                    if group.values.is_empty() && !group.is_default {
-                        return Ok(None); // unexpected shape
-                    }
-                    raw.push(group);
-                }
-                _ => {}
-            }
-        }
-        if raw.is_empty() {
-            return Ok(None);
-        }
-
-        // Phase 2: stacked labels (`case 1:` with no statements falling into
-        // the next labeled group) — fold their values into that group.
-        let mut merged: Vec<RawGroup> = Vec::new();
-        let mut pending_values: Vec<String> = Vec::new();
-        let mut pending_default = false;
-        let last_index = raw.len() - 1;
-        for (i, mut group) in raw.into_iter().enumerate() {
-            if !group.is_rule && group.stmts.is_empty() && i != last_index {
-                pending_values.append(&mut group.values);
-                pending_default |= group.is_default;
-                continue;
-            }
-            group.values = pending_values.drain(..).chain(group.values).collect();
-            group.is_default |= std::mem::take(&mut pending_default);
-            merged.push(group);
-        }
-
-        // Phase 3: faithfulness check per executable group + strip breaks.
-        let mut groups: Vec<(Vec<String>, bool, Vec<tree_sitter::Node>)> = Vec::new();
-        let merged_len = merged.len();
-        for (i, mut group) in merged.into_iter().enumerate() {
-            if !group.is_rule {
-                let breaks = count_breaks(&group.stmts);
-                let ends_with_break = group
-                    .stmts
-                    .last()
-                    .is_some_and(|s| s.kind() == "break_statement");
-                if breaks > 1 || (breaks == 1 && !ends_with_break) {
-                    return Ok(None); // conditional break
-                }
-                if ends_with_break {
-                    group.stmts.pop();
-                } else {
-                    let exits_always = group.stmts.last().is_some_and(|s| {
-                        s.kind() == "return_statement" || s.kind() == "throw_statement"
-                    });
-                    // fall-through to the END of the switch is fine;
-                    // fall-through into the next group is not modeled
-                    if !exits_always && i + 1 != merged_len {
-                        return Ok(None);
-                    }
-                }
-            }
-            groups.push((group.values, group.is_default, group.stmts));
-        }
+        let subject = &model.subject;
+        let groups = &model.groups;
 
         let mut exits = Vec::new();
-        let default_group: Option<usize> = groups.iter().position(|(_, is_default, _)| *is_default);
+        let default_group: Option<usize> = groups.iter().position(|g| g.is_default);
 
         // One fork per case value: earlier values false, this value true.
         let mut seen: Vec<String> = Vec::new();
-        for (values, _, stmts) in groups.clone() {
-            for value in values {
+        for group in groups {
+            for value in &group.values {
                 let label = format!("{subject} == {value}");
                 let mut branch = state.clone();
                 let mut feasible = true;
@@ -800,9 +709,9 @@ impl Walker<'_> {
                     }
                 }
                 if feasible && self.assign_atom(label, true, &mut branch)? {
-                    exits.extend(self.walk(&stmts, 0, branch, Some(future))?);
+                    exits.extend(self.walk(&group.body, 0, branch, Some(future))?);
                 }
-                seen.push(value);
+                seen.push(value.clone());
             }
         }
 
@@ -818,8 +727,7 @@ impl Walker<'_> {
         if feasible {
             match default_group {
                 Some(gi) => {
-                    let (_, _, stmts) = groups[gi].clone();
-                    exits.extend(self.walk(&stmts, 0, fallback, Some(future))?);
+                    exits.extend(self.walk(&groups[gi].body, 0, fallback, Some(future))?);
                 }
                 None => exits.push(fallback),
             }
@@ -909,28 +817,6 @@ fn collect_condition_texts(
     for child in children {
         collect_condition_texts(child, src, out);
     }
-}
-
-/// Count `break` statements binding to the enclosing switch (not descending
-/// into nested switches/loops, whose breaks bind there).
-fn count_breaks(stmts: &[tree_sitter::Node]) -> usize {
-    fn count(node: tree_sitter::Node) -> usize {
-        match node.kind() {
-            "break_statement" => 1,
-            "switch_expression"
-            | "switch_statement"
-            | "while_statement"
-            | "for_statement"
-            | "enhanced_for_statement"
-            | "do_statement" => 0,
-            _ => {
-                let mut cursor = node.walk();
-                let children: Vec<_> = node.children(&mut cursor).collect();
-                children.into_iter().map(count).sum()
-            }
-        }
-    }
-    stmts.iter().map(|&s| count(s)).sum()
 }
 
 fn parameter_names(method: tree_sitter::Node, src: &[u8]) -> std::collections::HashSet<String> {

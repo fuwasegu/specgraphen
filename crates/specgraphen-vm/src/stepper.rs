@@ -10,14 +10,17 @@
 //! execution state is plain data that can be snapshotted, serialized to a GUI,
 //! or driven from an MCP tool.
 //!
-//! Scope: models `if`/`else`, blocks, sequential statements, assignments, and
-//! terminal calls. Loops are presented as a choice — enter the body for one
-//! symbolic iteration, or skip it (zero iterations); both are sound world-lines
-//! (N>1 iterations are not enumerated). `switch` and `try` are still stepped
-//! over as opaque statements (flagged via [`Stop::opaque`]); if such a skipped
-//! construct can itself return/throw, the path is marked [`Stepper::is_incomplete`]
-//! so its reported outcome isn't trusted. Method calls are recorded as effects,
-//! not descended into (no cross-method step-into yet).
+//! Scope: models `if`/`else`, blocks, sequential statements, assignments,
+//! terminal calls, loops, and clean `switch`. Loops are a choice — enter the
+//! body for one symbolic iteration, or skip it (zero iterations); both are
+//! sound world-lines (N>1 not enumerated). A clean `switch` (every group ends
+//! in break/return/throw, or arrow rules) becomes one world-line per case with
+//! sequential-exclusivity atoms, sharing [`sym::parse_switch`] with the batch
+//! extractor. `try` and fall-through/conditional-break `switch` are still
+//! stepped over as opaque statements (flagged via [`Stop::opaque`]); if such a
+//! skipped construct can itself return/throw, the path is marked
+//! [`Stepper::is_incomplete`] so its outcome isn't trusted. Method calls are
+//! recorded as effects, not descended into (no cross-method step-into yet).
 
 use crate::sym::{self, AtomTable, Evaluator, SymError, SymState};
 
@@ -314,7 +317,8 @@ impl<'a> Stepper<'a> {
             }
             // do-while runs its body at least once: no zero-iteration world.
             "do_statement" => self.enter_loop(stmt, false),
-            // Still unmodeled (v1): step over. If such a construct can itself
+            "switch_expression" | "switch_statement" => self.enter_switch(stmt),
+            // Still unmodeled: step over. If such a construct can itself
             // terminate the method, this path's reported outcome is unreliable.
             _ => {
                 if contains_exit(stmt) {
@@ -361,6 +365,95 @@ impl<'a> Stepper<'a> {
                 body: None,
             },
         ];
+        Ok(self.branch_stop())
+    }
+
+    /// Present a clean `switch` as one world-line per case (plus default /
+    /// no-match), with the same sequential-exclusivity atoms the batch
+    /// extractor uses. Falls back to an opaque step when the switch can't be
+    /// modeled faithfully (fall-through / conditional break).
+    fn enter_switch(&mut self, stmt: tree_sitter::Node<'a>) -> Result<Stop, SymError> {
+        let Some(model) = sym::parse_switch(stmt, self.src) else {
+            if contains_exit(stmt) {
+                self.incomplete = true;
+            }
+            self.advance();
+            return Ok(Stop::stepped(true));
+        };
+        self.advance(); // past the switch; every world resumes after it
+
+        let subject = &model.subject;
+        let default_idx = model.groups.iter().position(|g| g.is_default);
+        let mut pending = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+
+        for group in &model.groups {
+            for value in &group.values {
+                let mut branch = self.state.clone();
+                let feasible = {
+                    let mut ev = Evaluator {
+                        src: self.src,
+                        atoms: &mut self.atoms,
+                    };
+                    let mut ok = true;
+                    for earlier in &seen {
+                        if !ev.assign_atom(
+                            &format!("{subject} == {earlier}"),
+                            false,
+                            &mut branch,
+                        )? {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        ok = ev.assign_atom(&format!("{subject} == {value}"), true, &mut branch)?;
+                    }
+                    ok
+                };
+                if feasible {
+                    pending.push(Pending {
+                        label: format!("{subject} == {value}"),
+                        state: branch,
+                        body: Some(group.body.clone()),
+                    });
+                }
+                seen.push(value.clone());
+            }
+        }
+
+        // The all-cases-false world: the default group, or skip past the switch.
+        let mut fallback = self.state.clone();
+        let feasible = {
+            let mut ev = Evaluator {
+                src: self.src,
+                atoms: &mut self.atoms,
+            };
+            let mut ok = true;
+            for value in &seen {
+                if !ev.assign_atom(&format!("{subject} == {value}"), false, &mut fallback)? {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        };
+        if feasible {
+            match default_idx {
+                Some(gi) => pending.push(Pending {
+                    label: "default (no case matches)".to_string(),
+                    state: fallback,
+                    body: Some(model.groups[gi].body.clone()),
+                }),
+                None => pending.push(Pending {
+                    label: "no case matches (skip)".to_string(),
+                    state: fallback,
+                    body: None,
+                }),
+            }
+        }
+
+        self.pending = pending;
         Ok(self.branch_stop())
     }
 
@@ -705,30 +798,57 @@ mod tests {
     }
 
     #[test]
-    fn opaque_construct_with_exit_marks_incomplete() {
-        // A switch containing returns is stepped over (v1); the post-switch
-        // return must not be trusted, so the path is flagged incomplete.
-        let src = r#"class A { String m(int x) {
-            switch (x) { case 1: return "one"; default: return "other"; }
+    fn clean_switch_offers_a_world_per_case() {
+        let src = r#"class A { String m(String code) {
+            switch (code) {
+                case "A": return "alpha";
+                case "B": return "beta";
+                default: return "other";
+            }
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // switch → branch
+        assert_eq!(stop.kind, StopKind::Branch);
+        // two cases + default = 3 world-lines
+        assert_eq!(stop.branches.len(), 3, "{:?}", stop.branches);
+        let beta = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("\"B\""))
+            .unwrap();
+        s.choose(beta).unwrap();
+        // sequential exclusivity: case "B" implies case "A" compared false
+        assert!(s
+            .context_rules()
+            .iter()
+            .any(|r| r.contains("\"A\" == false")));
+        let stop = s.step().unwrap();
+        assert_eq!(stop.outcome.as_deref(), Some("return \"beta\""));
+        assert!(!s.is_incomplete());
+    }
+
+    #[test]
+    fn unmodelable_construct_with_exit_marks_incomplete() {
+        // A try/finally containing a return is stepped over (still opaque);
+        // the post-try return must not be trusted, so the path is incomplete.
+        let src = r#"class A { String m() {
+            try { return "in-try"; } finally { cleanup(); }
             return "unreachable";
         } }"#;
         let tree = parse(src);
         let mut s = stepper_for(&tree, src.as_bytes());
-        let stop = s.step().unwrap(); // switch → opaque step
+        let stop = s.step().unwrap(); // try → opaque step
         assert!(stop.opaque);
         assert!(s.is_incomplete());
-        let stop = s.step().unwrap(); // the (actually unreachable) return
-        assert_eq!(stop.kind, StopKind::Terminated);
-        assert!(
-            s.is_incomplete(),
-            "outcome reached past an exit-containing switch"
-        );
     }
 
     #[test]
-    fn switch_is_opaque_in_v1() {
-        let src = r#"class A { int m(int x) {
-            switch (x) { case 1: return 1; default: return 0; }
+    fn fallthrough_switch_stays_opaque() {
+        // case 1 falls into case 2 (no break/return) — not faithfully modelable,
+        // so it stays an opaque step rather than fabricating world-lines.
+        let src = r#"class A { void m(int x) {
+            switch (x) { case 1: doOne(); case 2: doTwo(); break; default: break; }
         } }"#;
         let tree = parse(src);
         let mut s = stepper_for(&tree, src.as_bytes());
