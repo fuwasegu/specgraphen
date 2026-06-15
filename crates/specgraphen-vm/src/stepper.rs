@@ -280,7 +280,7 @@ impl<'a> Stepper<'a> {
                             self.src,
                         ));
                         let val = sym::normalize(&sym::text(value, self.src));
-                        self.state.writes.insert(name, val);
+                        sym::bind_local(&name, &val, &self.atoms, &mut self.state);
                     }
                 }
                 self.advance();
@@ -296,7 +296,7 @@ impl<'a> Stepper<'a> {
                         self.stack.clear();
                         return Ok(Stop::terminated(outcome));
                     }
-                    sym::record_write(*expr, self.src, &mut self.state);
+                    sym::record_write(*expr, self.src, &self.atoms, &mut self.state);
                 }
                 self.advance();
                 Ok(Stop::stepped(false))
@@ -464,7 +464,7 @@ impl<'a> Stepper<'a> {
         }
 
         self.pending = pending;
-        Ok(self.branch_stop())
+        Ok(self.settle())
     }
 
     /// Take world-line `option` at a paused branch and resume.
@@ -603,7 +603,7 @@ impl<'a> Stepper<'a> {
         // A bodyless else (the false world of an if without else) just
         // continues; collapse it so the user isn't asked a no-op question only
         // when there is genuinely one world.
-        Ok(self.branch_stop())
+        Ok(self.settle())
     }
 
     fn branch_stop(&self) -> Stop {
@@ -612,6 +612,28 @@ impl<'a> Stepper<'a> {
             branches: self.pending.iter().map(|p| p.label.clone()).collect(),
             outcome: None,
             opaque: false,
+        }
+    }
+
+    /// Resolve `self.pending`: with one feasible world there's no choice to
+    /// make, so take it directly (a pinned/feasibility-collapsed condition
+    /// shouldn't present a fake single-option branch); with several, pause.
+    fn settle(&mut self) -> Stop {
+        match self.pending.len() {
+            0 => Stop::stepped(false),
+            1 => {
+                let only = self.pending.remove(0);
+                self.state = only.state;
+                if let Some(body) = only.body {
+                    self.stack.push(Frame {
+                        stmts: body,
+                        idx: 0,
+                        label: only.label,
+                    });
+                }
+                Stop::stepped(false)
+            }
+            _ => self.branch_stop(),
         }
     }
 
@@ -955,6 +977,72 @@ mod tests {
         }
         assert_eq!(s.state().writes.get("this.a"), Some(&"1".to_string()));
         assert_eq!(s.state().writes.get("this.b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn reassigned_flag_is_not_stale_pinned() {
+        // The real legacy shape (BF L1015/L1017): a flag is tested, reassigned
+        // true in the same region, then re-tested. The old behavior pinned the
+        // first test's value and contradicted the assignment; now the literal
+        // re-pin makes the re-test follow the assigned value.
+        let src = r#"class A { String m() {
+            if (!flag) {
+                flag = true;
+                if (flag) { return "on"; }
+                return "unreachable";
+            }
+            return "off";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // if (!flag)
+                                      // take the !flag == true world (flag pinned false)
+        let t = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("{true}"))
+            .unwrap();
+        s.choose(t).unwrap();
+        s.step().unwrap(); // flag = true → re-pins flag atom to true
+                           // if (flag): flag now pinned true → no fork, enters the body
+        let stop = s.step().unwrap();
+        assert!(
+            stop.kind != StopKind::Branch,
+            "flag reassigned true; re-test must follow it, not the stale pin: {stop:?}"
+        );
+        let stop = s.step().unwrap();
+        assert_eq!(stop.outcome.as_deref(), Some("return \"on\""));
+    }
+
+    #[test]
+    fn reassigning_a_condition_variable_reforks() {
+        // After `x = readNext()` (opaque value), a prior `x.equals("A")` pin is
+        // dropped, so a later test of `x` re-forks rather than staying stuck.
+        let src = r#"class A { String m(String x) {
+            if (x.equals("A")) {
+                x = readNext();
+                if (x.equals("A")) { return "again"; }
+                return "moved";
+            }
+            return "no";
+        } }"#;
+        let tree = parse(src);
+        let mut s = stepper_for(&tree, src.as_bytes());
+        let stop = s.step().unwrap(); // if x.equals("A")
+        let t = stop
+            .branches
+            .iter()
+            .position(|b| b.contains("{true}"))
+            .unwrap();
+        s.choose(t).unwrap();
+        s.step().unwrap(); // x = readNext() → invalidates x.equals("A") pin
+        let stop = s.step().unwrap(); // second if x.equals("A") → re-forks
+        assert_eq!(
+            stop.kind,
+            StopKind::Branch,
+            "reassigned x must let the re-test fork: {stop:?}"
+        );
+        assert_eq!(stop.branches.len(), 2);
     }
 
     #[test]

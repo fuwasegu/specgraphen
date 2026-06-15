@@ -10,7 +10,10 @@
 //! same boolean variable — interned in an [`AtomTable`]. `&&`/`||` are
 //! decomposed with short-circuit path semantics and `!` flips the value. An
 //! atom already pinned on a path follows its assigned value, so infeasible
-//! combinations are never produced.
+//! combinations are never produced — but a write to a variable a pinned atom
+//! references **invalidates** that pin ([`record_write`]/[`bind_local`]), so
+//! the common `flag = true; if (flag)` pattern re-tests against the new value
+//! instead of contradicting it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -88,6 +91,11 @@ impl AtomTable {
 
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
+    }
+
+    /// Look up an existing atom id without interning.
+    pub fn id_of(&self, label: &str) -> Option<usize> {
+        self.names.iter().position(|a| a == label)
     }
 }
 
@@ -213,7 +221,13 @@ impl Evaluator<'_> {
 
 /// Record an assignment / increment / observable call as a symbolic effect on
 /// `state`. Anything else is ignored — its side effects are not modeled.
-pub fn record_write(expr: tree_sitter::Node, src: &[u8], state: &mut SymState) {
+///
+/// Crucially, writing a variable also **invalidates condition atoms that
+/// reference it**: feasibility-pinning assumes a condition's value is stable,
+/// but legacy code mutates a flag then re-tests it (`flag = true; if (flag)`).
+/// Without this, the stale pin contradicts the new value. A literal boolean
+/// assignment re-pins the bare-variable atom to the assigned value.
+pub fn record_write(expr: tree_sitter::Node, src: &[u8], atoms: &AtomTable, state: &mut SymState) {
     match expr.kind() {
         "assignment_expression" => {
             let (Some(left), Some(right)) = (
@@ -234,14 +248,24 @@ pub fn record_write(expr: tree_sitter::Node, src: &[u8], state: &mut SymState) {
             } else {
                 normalize(&text(expr, src))
             };
-            state.writes.insert(target, value);
+            state.writes.insert(target.clone(), value.clone());
+            invalidate(state, atoms, &target);
+            // Precision: `x = true/false` re-pins the bare-variable atom so a
+            // later `if (x)` follows the assigned value instead of re-forking.
+            if operator == "=" && (value == "true" || value == "false") {
+                if let Some(id) = atoms.id_of(&target) {
+                    state.conds.retain(|(i, _)| *i != id);
+                    state.conds.push((id, value == "true"));
+                }
+            }
         }
         "update_expression" => {
             // i++ / --i: opaque value, but an observable write
             let whole = normalize(&text(expr, src));
             let target = whole.trim_matches(['+', '-', ' ']).to_string();
             if !target.is_empty() {
-                state.writes.insert(target, whole);
+                state.writes.insert(target.clone(), whole);
+                invalidate(state, atoms, &target);
             }
         }
         "method_invocation" => {
@@ -255,6 +279,44 @@ pub fn record_write(expr: tree_sitter::Node, src: &[u8], state: &mut SymState) {
         }
         _ => {}
     }
+}
+
+/// Bind a declared local (`T name = value`): record the write and invalidate
+/// any condition atom that referenced `name` (a redeclaration changes it).
+pub fn bind_local(name: &str, value: &str, atoms: &AtomTable, state: &mut SymState) {
+    state.writes.insert(name.to_string(), value.to_string());
+    invalidate(state, atoms, name);
+}
+
+/// Drop condition atoms whose label textually references variable `var` — their
+/// pinned value is no longer trustworthy after `var` was written.
+fn invalidate(state: &mut SymState, atoms: &AtomTable, var: &str) {
+    state
+        .conds
+        .retain(|(id, _)| !references(atoms.name(*id), var));
+}
+
+/// Does `label` mention `var` as a whole identifier token? `.` counts as a
+/// boundary, so `status` matches in `status.equals("X")`. Over-matching only
+/// causes a sound re-fork, so the check errs toward inclusion.
+fn references(label: &str, var: &str) -> bool {
+    if var.is_empty() {
+        return false;
+    }
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let bytes = label.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = label[from..].find(var) {
+        let start = from + rel;
+        let end = start + var.len();
+        let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+        let after_ok = end == label.len() || !is_ident(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// Does this invocation match a configured process-terminating callee?
@@ -553,15 +615,14 @@ mod tests {
         let tree = parse(src);
         let bytes = src.as_bytes();
         let mut state = SymState::default();
-        let mut cursor = tree.root_node().walk();
+        let atoms = AtomTable::new(16);
         // walk to the method body statements
         let body = find(tree.root_node(), "block").unwrap();
         for stmt in named_children(body) {
             if let Some(expr) = named_children(stmt).first() {
-                record_write(*expr, bytes, &mut state);
+                record_write(*expr, bytes, &atoms, &mut state);
             }
         }
-        let _ = &mut cursor;
         assert_eq!(state.writes.get("x"), Some(&"5".to_string()));
         assert!(state.calls.iter().any(|c| c.contains("doThing")));
         assert!(!state.calls.iter().any(|c| c.contains("logger")));

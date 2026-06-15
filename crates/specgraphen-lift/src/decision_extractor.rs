@@ -400,7 +400,8 @@ impl Walker<'_> {
                     let name = normalize(&text(name, self.src));
                     self.locals.insert(name.clone());
                     if let Some(value) = declarator.child_by_field_name("value") {
-                        state.writes.insert(name, normalize(&text(value, self.src)));
+                        let val = normalize(&text(value, self.src));
+                        sym::bind_local(&name, &val, &self.atoms, &mut state);
                     }
                 }
                 self.walk(stmts, idx + 1, state, beyond)
@@ -417,7 +418,7 @@ impl Walker<'_> {
                         self.paths.push((state, call));
                         return Ok(Vec::new());
                     }
-                    sym::record_write(*expr, self.src, &mut state);
+                    sym::record_write(*expr, self.src, &self.atoms, &mut state);
                 }
                 self.walk(stmts, idx + 1, state, beyond)
             }
