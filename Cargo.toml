@@ -13,6 +13,7 @@ members = [
     "crates/specgraphen-resolver",
     "crates/specgraphen-logic",
     "crates/specgraphen-vm",
+    "crates/specgraphen-topology",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ specgraphen-mcp = { path = "crates/specgraphen-mcp" }
 specgraphen-resolver = { path = "crates/specgraphen-resolver" }
 specgraphen-logic = { path = "crates/specgraphen-logic" }
 specgraphen-vm = { path = "crates/specgraphen-vm" }
+specgraphen-topology = { path = "crates/specgraphen-topology" }
 
 # External
 serde = { version = "1", features = ["derive"] }

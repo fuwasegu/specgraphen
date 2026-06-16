@@ -24,6 +24,18 @@ pub struct RelationRecord {
     pub witness: WitnessInfo,
 }
 
+/// A relation the lifter could not resolve to a known cell (e.g. an
+/// unresolved call or construction). Carried as a structured obstruction so
+/// `unknowns` can surface it and corroboration can feed it to HG completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnresolvedRecord {
+    pub from_fqn: String,
+    pub target_text: String,
+    pub relation_type: crate::JavaRelationType,
+    pub file: String,
+    pub line: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpaceData {
     pub space: Space,
@@ -36,6 +48,8 @@ pub struct SpaceData {
     pub annotations: HashMap<String, SemanticAnnotation>,
     #[serde(default)]
     pub obstructions: Vec<String>,
+    #[serde(default)]
+    pub unresolved: Vec<UnresolvedRecord>,
     #[serde(skip)]
     store: Option<InMemorySpaceStore>,
 }
@@ -58,6 +72,7 @@ impl SpaceData {
             fqn_to_cell_id,
             annotations: HashMap::new(),
             obstructions: Vec::new(),
+            unresolved: Vec::new(),
             store: None,
         }
     }

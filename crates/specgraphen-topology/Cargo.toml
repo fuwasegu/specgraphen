@@ -1,0 +1,15 @@
+[package]
+name = "specgraphen-topology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure topological-data-analysis layer: builds Vietoris-Rips filtrations from code-distance matrices and delegates persistent homology to Higher Graphen to detect stable domain clusters"
+
+[dependencies]
+higher-graphen-core.workspace = true
+higher-graphen-structure.workspace = true
+specgraphen-model.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

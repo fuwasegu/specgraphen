@@ -13,7 +13,11 @@ pub struct UnknownsResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UnresolvedRef {
-    pub message: String,
+    pub from_fqn: String,
+    pub target: String,
+    pub relation_type: String,
+    pub file: String,
+    pub line: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,11 +83,34 @@ pub fn unknowns(space_data: &SpaceData, scope: Option<&str>) -> Result<UnknownsR
         }
     }
 
-    let total_unknowns = obstructions.len() + low_confidence.len();
+    // Unresolved references collected during lift (calls/constructions that
+    // could not be bound to a known cell) — surfaced as Known Unknowns.
+    let unresolved_references: Vec<UnresolvedRef> = space_data
+        .unresolved
+        .iter()
+        .filter(|u| {
+            scope_lower
+                .as_ref()
+                .map(|s| {
+                    u.from_fqn.to_lowercase().contains(s)
+                        || u.target_text.to_lowercase().contains(s)
+                })
+                .unwrap_or(true)
+        })
+        .map(|u| UnresolvedRef {
+            from_fqn: u.from_fqn.clone(),
+            target: u.target_text.clone(),
+            relation_type: u.relation_type.relation_type_str().to_string(),
+            file: u.file.clone(),
+            line: u.line,
+        })
+        .collect();
+
+    let total_unknowns = obstructions.len() + low_confidence.len() + unresolved_references.len();
 
     Ok(UnknownsResult {
         scope: scope_str,
-        unresolved_references: Vec::new(),
+        unresolved_references,
         low_confidence_entities: low_confidence,
         obstructions,
         total_unknowns,
