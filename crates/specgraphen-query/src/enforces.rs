@@ -96,3 +96,25 @@ fn fqn_of(space_data: &SpaceData, cell_id: &str) -> String {
         .map(|(k, _)| k.clone())
         .unwrap_or_else(|| cell_id.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::lift_fixture;
+
+    #[test]
+    fn returns_a_status_on_the_call_graph() {
+        let sd = lift_fixture();
+        let r = enforces(&sd, "com.example.service.UserService", "java.calls", 3).unwrap();
+        assert!(matches!(
+            r.status.as_str(),
+            "satisfied" | "violated" | "unknown"
+        ));
+    }
+
+    #[test]
+    fn errors_on_unknown_symbol() {
+        let sd = lift_fixture();
+        assert!(enforces(&sd, "no.such.Symbol.xyz", "java.calls", 3).is_err());
+    }
+}

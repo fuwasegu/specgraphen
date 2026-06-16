@@ -1322,6 +1322,7 @@ dependencies = [
  "higher-graphen-core",
  "higher-graphen-evidence",
  "higher-graphen-reasoning",
+ "higher-graphen-structure",
  "serde",
  "serde_json",
  "specgraphen-lift",
@@ -1428,6 +1429,7 @@ dependencies = [
  "specgraphen-lift",
  "specgraphen-model",
  "specgraphen-store",
+ "specgraphen-topology",
  "tracing",
 ]
 

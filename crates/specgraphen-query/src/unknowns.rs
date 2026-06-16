@@ -116,3 +116,30 @@ pub fn unknowns(space_data: &SpaceData, scope: Option<&str>) -> Result<UnknownsR
         total_unknowns,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::lift_fixture;
+
+    #[test]
+    fn total_is_sum_of_parts() {
+        let sd = lift_fixture();
+        let r = unknowns(&sd, None).unwrap();
+        assert_eq!(
+            r.total_unknowns,
+            r.obstructions.len() + r.low_confidence_entities.len() + r.unresolved_references.len()
+        );
+    }
+
+    #[test]
+    fn unresolved_refs_carry_structured_fields() {
+        let sd = lift_fixture();
+        let r = unknowns(&sd, None).unwrap();
+        // Every surfaced unresolved ref must carry a witness location.
+        for u in &r.unresolved_references {
+            assert!(!u.relation_type.is_empty());
+            assert!(!u.file.is_empty());
+        }
+    }
+}

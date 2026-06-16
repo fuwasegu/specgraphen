@@ -9,6 +9,7 @@ description = "Query engine: explain, callers, callees, and impact analysis"
 [dependencies]
 specgraphen-model.workspace = true
 specgraphen-store.workspace = true
+specgraphen-topology.workspace = true
 higher-graphen-structure.workspace = true
 higher-graphen-projection.workspace = true
 higher-graphen-reasoning.workspace = true

@@ -96,3 +96,51 @@ fn make_provenance(file: &str, line: u32) -> Provenance {
         .expect("valid title");
     Provenance::new(source_ref, Confidence::new(0.5).expect("valid confidence"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use higher_graphen_structure::space::Space;
+    use specgraphen_model::space_data::UnresolvedRecord;
+    use specgraphen_model::JavaRelationType;
+
+    fn space_with(unresolved: Vec<UnresolvedRecord>) -> SpaceData {
+        let space = Space::new(Id::new("test").expect("id"), "test");
+        let mut sd = SpaceData::new(space, vec![], vec![], vec![], vec![], Default::default());
+        sd.unresolved = unresolved;
+        sd
+    }
+
+    fn rec() -> UnresolvedRecord {
+        UnresolvedRecord {
+            from_fqn: "com.example.A.foo".to_string(),
+            target_text: "bar".to_string(),
+            relation_type: JavaRelationType::Calls,
+            file: "A.java".to_string(),
+            line: 1,
+        }
+    }
+
+    #[test]
+    fn empty_unresolved_yields_no_candidates() {
+        let stats = run_obstruction_completion(&space_with(vec![]), 0.8, 0.4).unwrap();
+        assert_eq!(stats.candidates, 0);
+    }
+
+    #[test]
+    fn fixed_confidence_lands_in_pending_at_default_thresholds() {
+        // Unresolved refs carry confidence 0.5; with high=0.8/low=0.4 that is pending.
+        let stats = run_obstruction_completion(&space_with(vec![rec(), rec()]), 0.8, 0.4).unwrap();
+        assert_eq!(stats.candidates, 2);
+        assert_eq!(stats.pending, 2);
+        assert_eq!(stats.auto_accepted, 0);
+        assert_eq!(stats.auto_rejected, 0);
+    }
+
+    #[test]
+    fn low_threshold_auto_accepts() {
+        let stats = run_obstruction_completion(&space_with(vec![rec()]), 0.4, 0.3).unwrap();
+        assert_eq!(stats.auto_accepted, 1);
+        assert_eq!(stats.pending, 0);
+    }
+}

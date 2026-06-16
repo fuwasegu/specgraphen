@@ -216,3 +216,33 @@ pub fn spec_loss_report(space_data: &SpaceData) -> Result<SpecLossReport> {
             .collect(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::lift_fixture;
+
+    #[test]
+    fn reports_sections_and_severity() {
+        let sd = lift_fixture();
+        let r = spec_loss_report(&sd).unwrap();
+        assert!(r.projected_sections > 0, "fixture has class entities");
+        assert!(matches!(
+            r.risk_severity.as_str(),
+            "low" | "medium" | "high"
+        ));
+        // The spec omits non-class/method entities (fields, packages).
+        assert!(r.total_sources >= r.projected_sections);
+    }
+
+    #[test]
+    fn empty_space_is_low_risk() {
+        use higher_graphen_structure::space::Space;
+        use specgraphen_model::SpaceData;
+        let space = Space::new(higher_graphen_core::Id::new("empty").unwrap(), "empty");
+        let sd = SpaceData::new(space, vec![], vec![], vec![], vec![], Default::default());
+        let r = spec_loss_report(&sd).unwrap();
+        assert_eq!(r.projected_sections, 0);
+        assert_eq!(r.risk_severity, "low");
+    }
+}

@@ -266,6 +266,51 @@ impl SpecGraphenServer {
                     }
                 },
                 {
+                    "name": "enforces",
+                    "description": "Check whether a required relation (e.g. 'java.calls') is reachable from an entry symbol within a depth bound, via HG bounded model checking. Returns satisfied/violated/unknown with visited cells and obstructions.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "entry_symbol": {
+                                "type": "string",
+                                "description": "Entry symbol to start the bounded check from"
+                            },
+                            "required_relation": {
+                                "type": "string",
+                                "description": "Relation type that must occur (e.g. 'java.calls')"
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Max traversal depth (default 5)"
+                            }
+                        },
+                        "required": ["entry_symbol", "required_relation"]
+                    }
+                },
+                {
+                    "name": "spec_loss",
+                    "description": "Measure information loss of the human spec projection via HG's projection kernel — omitted entities, members folded into class sections, undeclared loss, and an overall review risk severity. Use to gauge how complete/honest the generated spec is.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                },
+                {
+                    "name": "domain_clusters",
+                    "description": "Detect domain clusters via topological data analysis (persistent homology over the call graph) and flag clusters that span multiple packages — refactor/boundary candidates. Higher min_lifetime keeps only the most stable clusters.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "min_lifetime": {
+                                "type": "integer",
+                                "description": "Minimum persistence lifetime (stages) to keep a cluster (default 2)"
+                            }
+                        },
+                        "required": []
+                    }
+                },
+                {
                     "name": "enrich",
                     "description": "Get source code and structural context for a symbol, ready for semantic analysis. Returns the source code, callers, callees, containing class, and analysis instructions. Use this to understand a symbol deeply, then call `annotate` to save your analysis.",
                     "inputSchema": {
@@ -557,6 +602,38 @@ impl SpecGraphenServer {
                 let result = self
                     .query_engine
                     .unknowns(scope)
+                    .map_err(|e| (-32000, format!("Error: {e}")))?;
+                serde_json::to_string_pretty(&result)
+                    .map_err(|e| (-32000, format!("Serialization error: {e}")))?
+            }
+            "enforces" => {
+                let entry = arguments["entry_symbol"]
+                    .as_str()
+                    .ok_or((-32602, "Missing entry_symbol argument".to_string()))?;
+                let relation = arguments["required_relation"]
+                    .as_str()
+                    .ok_or((-32602, "Missing required_relation argument".to_string()))?;
+                let max_depth = arguments["max_depth"].as_u64().unwrap_or(5) as usize;
+                let result = self
+                    .query_engine
+                    .enforces(entry, relation, max_depth)
+                    .map_err(|e| (-32000, format!("Error: {e}")))?;
+                serde_json::to_string_pretty(&result)
+                    .map_err(|e| (-32000, format!("Serialization error: {e}")))?
+            }
+            "spec_loss" => {
+                let result = self
+                    .query_engine
+                    .spec_loss_report()
+                    .map_err(|e| (-32000, format!("Error: {e}")))?;
+                serde_json::to_string_pretty(&result)
+                    .map_err(|e| (-32000, format!("Serialization error: {e}")))?
+            }
+            "domain_clusters" => {
+                let min_lifetime = arguments["min_lifetime"].as_u64().unwrap_or(2) as usize;
+                let result = self
+                    .query_engine
+                    .domain_clusters(min_lifetime)
                     .map_err(|e| (-32000, format!("Error: {e}")))?;
                 serde_json::to_string_pretty(&result)
                     .map_err(|e| (-32000, format!("Serialization error: {e}")))?
