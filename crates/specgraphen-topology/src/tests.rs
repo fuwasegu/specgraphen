@@ -68,6 +68,28 @@ fn space_with_calls(points: &[(&str, &str)], calls: &[(&str, &str)]) -> SpaceDat
     )
 }
 
+fn two_disconnected_clique_matrix() -> DistanceMatrix {
+    let space = space_with_calls(
+        &[
+            ("A", "com.order.A"),
+            ("B", "com.order.B"),
+            ("C", "com.order.C"),
+            ("D", "com.billing.D"),
+            ("E", "com.billing.E"),
+            ("F", "com.billing.F"),
+        ],
+        &[
+            ("A", "B"),
+            ("B", "C"),
+            ("C", "A"),
+            ("D", "E"),
+            ("E", "F"),
+            ("F", "D"),
+        ],
+    );
+    call_hop_distance_matrix(&space)
+}
+
 #[test]
 fn hop_distance_is_undirected_and_marks_unreachable() {
     // A -> B -> C is a directed chain; distance must ignore direction.
@@ -112,30 +134,25 @@ fn two_disconnected_cliques_yield_two_persistent_clusters() {
     // Triangle {A,B,C} and triangle {D,E,F}, no edge between them. Each clique
     // collapses to one component at eps=1 and the two never merge, so H0 keeps
     // exactly two open (forever-lived) components: two stable clusters.
-    let space = space_with_calls(
-        &[
-            ("A", "com.order.A"),
-            ("B", "com.order.B"),
-            ("C", "com.order.C"),
-            ("D", "com.billing.D"),
-            ("E", "com.billing.E"),
-            ("F", "com.billing.F"),
-        ],
-        &[
-            ("A", "B"),
-            ("B", "C"),
-            ("C", "A"),
-            ("D", "E"),
-            ("E", "F"),
-            ("F", "D"),
-        ],
-    );
-    let matrix = call_hop_distance_matrix(&space);
+    let matrix = two_disconnected_clique_matrix();
     let analysis =
         detect_domain_clusters(&matrix, DomainClusterOptions::default()).expect("analysis");
 
     assert_eq!(analysis.clusters.len(), 2, "two stable clusters");
     assert_eq!(analysis.persistence.open_component_count, 2);
+    let last_stage_index = analysis.persistence.stages.len() - 1;
+    let mut open_h0_lifetimes = analysis
+        .persistence
+        .intervals
+        .iter()
+        .filter(|interval| interval.dimension == 0 && interval.is_open())
+        .map(|interval| interval.lifetime_stages(last_stage_index))
+        .collect::<Vec<_>>();
+    open_h0_lifetimes.sort_unstable();
+    // HG v0.7.1 counts an open interval through the last stage
+    // (`last_stage_index + 1 - birth`), so these two-stage clusters have
+    // lifetime 2 and satisfy the default min_lifetime.
+    assert_eq!(open_h0_lifetimes, vec![2, 2]);
 
     let mut members: Vec<Vec<String>> = analysis
         .clusters
@@ -162,6 +179,47 @@ fn two_disconnected_cliques_yield_two_persistent_clusters() {
         assert_eq!(cluster.confidence, 1.0, "open interval is fully persistent");
     }
     assert!(analysis.boundary_drifts().is_empty());
+}
+
+#[test]
+fn min_lifetime_filters_cut_stage_clusters() {
+    let matrix = two_disconnected_clique_matrix();
+    let analysis = detect_domain_clusters(
+        &matrix,
+        DomainClusterOptions {
+            min_lifetime_stages: 3,
+        },
+    )
+    .expect("analysis");
+
+    // The cut-stage fallback is still the last stage, but each open H0 interval
+    // has lifetime 2 under HG v0.7.1, so option (b) filters both clusters.
+    assert_eq!(
+        analysis.cut_stage_index,
+        analysis.persistence.stages.len() - 1
+    );
+    assert_eq!(analysis.persistence.open_component_count, 2);
+    assert!(analysis.clusters.is_empty());
+}
+
+#[test]
+fn hg_h0_generators_match_cut_stage_component_representatives() {
+    let matrix = two_disconnected_clique_matrix();
+    let analysis =
+        detect_domain_clusters(&matrix, DomainClusterOptions::default()).expect("analysis");
+
+    let last_stage_index = analysis.persistence.stages.len() - 1;
+    let lifetime_by_generator = h0_lifetime_by_generator(&analysis.persistence, last_stage_index);
+    let stage = &analysis.persistence.stages[analysis.cut_stage_index];
+
+    assert_eq!(stage.topology.connected_components.len(), 2);
+    for component in &stage.topology.connected_components {
+        assert!(
+            lifetime_by_generator.contains_key(component.representative_cell_id.as_str()),
+            "HG H0 generator id must match component representative {}",
+            component.representative_cell_id
+        );
+    }
 }
 
 #[test]
@@ -243,7 +301,7 @@ fn graduated_distances_track_a_merge_and_pick_the_two_cluster_cut() {
         .expect("analysis with graduated distances");
 
     // Stages: eps in {0,1,3} -> 3 stages (indices 0,1,2). Component counts go
-    // 4 -> 2 -> 1. The cut is the earliest 2-component stage (index 1).
+    // 4 -> 2 -> 1. The cut is the latest 2-component stage (index 1).
     assert_eq!(analysis.persistence.stages.len(), 3);
     let component_counts: Vec<usize> = analysis
         .persistence

@@ -43,7 +43,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use higher_graphen_core::Id;
 use higher_graphen_structure::space::{Cell, ComplexType, InMemorySpaceStore, Space};
 use higher_graphen_structure::topology::{
-    summarize_filtration_with_options, FiltrationStage, PersistenceOptions, PersistenceSummary,
+    summarize_filtration_with_options, ConnectedComponentSummary, FiltrationStage,
+    PersistenceOptions, PersistenceSummary,
 };
 use specgraphen_model::SpaceData;
 
@@ -492,26 +493,19 @@ fn extract_clusters(
         .filter_map(|p| p.fqn.as_deref().map(|fqn| (p.cell_id.as_str(), fqn)))
         .collect();
 
-    // H0 lifetime per *birth* component, keyed by its representative cell id.
-    // A component's representative is the smallest cell id among its members,
-    // which is exactly how HG names the H0 interval generator.
-    let lifetime_by_generator: HashMap<&str, usize> = summary
-        .intervals
-        .iter()
-        .filter(|interval| interval.dimension == 0)
-        .filter_map(|interval| {
-            interval
-                .generator_cell_ids
-                .first()
-                .map(|gen| (gen.as_str(), interval.lifetime_stages(last_stage_index)))
-        })
-        .collect();
+    let lifetime_by_generator = h0_lifetime_by_generator(summary, last_stage_index);
+    let min_lifetime = summary.options.min_lifetime_stages;
 
     let mut clusters: Vec<DomainCluster> = stage
         .topology
         .connected_components
         .iter()
-        .map(|component| {
+        .filter_map(|component| {
+            let persistence_lifetime = component_h0_lifetime(component, &lifetime_by_generator);
+            if persistence_lifetime < min_lifetime {
+                return None;
+            }
+
             let member_cell_ids: Vec<String> = component
                 .vertex_cell_ids
                 .iter()
@@ -525,20 +519,13 @@ fn extract_clusters(
 
             let packages = distinct_packages(&member_fqns);
 
-            // The component's representative is HG's deterministic smallest id;
-            // its H0 interval (born at stage 0) carries the lifetime.
-            let persistence_lifetime = lifetime_by_generator
-                .get(component.representative_cell_id.as_str())
-                .copied()
-                .unwrap_or(0);
-
-            DomainCluster {
+            Some(DomainCluster {
                 member_cell_ids,
                 member_fqns,
                 packages,
                 persistence_lifetime,
                 confidence: lifetime_to_confidence(persistence_lifetime, last_stage_index),
-            }
+            })
         })
         .collect();
 
@@ -549,6 +536,38 @@ fn extract_clusters(
             .then_with(|| a.member_cell_ids.cmp(&b.member_cell_ids))
     });
     clusters
+}
+
+fn h0_lifetime_by_generator(
+    summary: &PersistenceSummary,
+    last_stage_index: usize,
+) -> HashMap<&str, usize> {
+    summary
+        .intervals
+        .iter()
+        .filter(|interval| interval.dimension == 0)
+        .filter_map(|interval| {
+            interval
+                .generator_cell_ids
+                .first()
+                .map(|gen| (gen.as_str(), interval.lifetime_stages(last_stage_index)))
+        })
+        .collect()
+}
+
+fn component_h0_lifetime(
+    component: &ConnectedComponentSummary,
+    lifetime_by_generator: &HashMap<&str, usize>,
+) -> usize {
+    let representative = component.representative_cell_id.as_str();
+    debug_assert!(
+        lifetime_by_generator.contains_key(representative),
+        "HG H0 interval generators must match cut-stage component representatives"
+    );
+    lifetime_by_generator
+        .get(representative)
+        .copied()
+        .expect("HG H0 interval generator missing for cut-stage component representative")
 }
 
 /// Distinct sorted package prefixes for a set of FQNs.

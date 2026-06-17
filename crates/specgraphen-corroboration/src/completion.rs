@@ -55,7 +55,7 @@ pub fn run_obstruction_completion(
             ObstructionType::MissingMorphism,
             explanation,
             Severity::Low,
-            make_provenance(&u.file, u.line),
+            make_provenance(&u.file, u.line)?,
         )
         .with_required_resolution(RequiredResolution::new(format!(
             "resolve reference to {}",
@@ -88,13 +88,11 @@ pub fn run_obstruction_completion(
     Ok(stats)
 }
 
-fn make_provenance(file: &str, line: u32) -> Provenance {
+fn make_provenance(file: &str, line: u32) -> anyhow::Result<Provenance> {
     let source_ref = SourceRef::new(SourceKind::Code)
-        .with_uri(format!("{file}#L{line}"))
-        .expect("valid uri")
-        .with_title(file.to_string())
-        .expect("valid title");
-    Provenance::new(source_ref, Confidence::new(0.5).expect("valid confidence"))
+        .with_uri(format!("{file}#L{line}"))?
+        .with_title(file.to_string())?;
+    Ok(Provenance::new(source_ref, Confidence::new(0.5)?))
 }
 
 #[cfg(test)]
