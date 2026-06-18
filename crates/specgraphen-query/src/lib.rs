@@ -5,6 +5,8 @@ mod column_usage;
 mod crud;
 mod dead_code;
 mod dependencies;
+mod domain;
+mod enforces;
 pub mod enrich;
 mod explain;
 pub mod export;
@@ -31,11 +33,14 @@ pub use column_usage::ColumnUsageResult;
 pub use crud::CrudMatrixResult;
 pub use dead_code::DeadCodeResult;
 pub use dependencies::DependencyResult;
+pub use domain::DomainClustersResult;
+pub use enforces::EnforcesResult;
 pub use enrich::{EnrichBatchRequest, EnrichRequest};
 pub use feature::FeatureResult;
 pub use hotspots::HotspotsResult;
 pub use impact::ImpactResult;
 pub use overview::OverviewResult;
+pub use projection::SpecLossReport;
 pub use search::SearchResult;
 pub use types::{CallGraphResult, CallRelation, ConfidenceWrapped, ExplainResult, WitnessRef};
 pub use unknowns::UnknownsResult;
@@ -131,6 +136,21 @@ impl QueryEngine {
         impact::impact(&data, symbol, max_depth)
     }
 
+    pub fn enforces(
+        &self,
+        entry_symbol: &str,
+        required_relation: &str,
+        max_depth: usize,
+    ) -> Result<EnforcesResult> {
+        let data = self.space_data.read().unwrap();
+        enforces::enforces(&data, entry_symbol, required_relation, max_depth)
+    }
+
+    pub fn domain_clusters(&self, min_lifetime: usize) -> Result<DomainClustersResult> {
+        let data = self.space_data.read().unwrap();
+        domain::domain_clusters(&data, min_lifetime)
+    }
+
     pub fn column_usage(&self, table_class: &str) -> Result<ColumnUsageResult> {
         let data = self.space_data.read().unwrap();
         column_usage::column_usage(&data, table_class, &self.source_files)
@@ -154,6 +174,11 @@ impl QueryEngine {
     pub fn spec_markdown(&self) -> Result<String> {
         let data = self.space_data.read().unwrap();
         export::spec_markdown(&data)
+    }
+
+    pub fn spec_loss_report(&self) -> Result<SpecLossReport> {
+        let data = self.space_data.read().unwrap();
+        projection::spec_loss_report(&data)
     }
 
     pub fn enrich(&self, symbol: &str) -> Result<EnrichRequest> {
@@ -199,6 +224,26 @@ impl QueryEngine {
         );
         snapshot.annotations = data.annotations.clone();
         snapshot.obstructions = data.obstructions.clone();
+        snapshot.unresolved = data.unresolved.clone();
         Ok(snapshot)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use specgraphen_model::SpaceData;
+    use std::path::PathBuf;
+
+    /// Lift the repository's `simple-project` fixture into a real `SpaceData`
+    /// (store already built by `lift`). Shared by the query module tests.
+    pub(crate) fn lift_fixture() -> SpaceData {
+        let mut lifter = specgraphen_lift::JavaLifter::new().expect("lifter");
+        let config = specgraphen_lift::LiftConfig {
+            root_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/simple-project"),
+            space_id: "test".to_string(),
+            ..Default::default()
+        };
+        lifter.lift(&config).expect("lift fixture").space_data
     }
 }

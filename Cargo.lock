@@ -1322,6 +1322,7 @@ dependencies = [
  "higher-graphen-core",
  "higher-graphen-evidence",
  "higher-graphen-reasoning",
+ "higher-graphen-structure",
  "serde",
  "serde_json",
  "specgraphen-lift",
@@ -1421,12 +1422,14 @@ dependencies = [
  "anyhow",
  "higher-graphen-core",
  "higher-graphen-projection",
+ "higher-graphen-reasoning",
  "higher-graphen-structure",
  "serde",
  "serde_json",
  "specgraphen-lift",
  "specgraphen-model",
  "specgraphen-store",
+ "specgraphen-topology",
  "tracing",
 ]
 
@@ -1457,6 +1460,16 @@ dependencies = [
  "specgraphen-model",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "specgraphen-topology"
+version = "1.12.0"
+dependencies = [
+ "higher-graphen-core",
+ "higher-graphen-structure",
+ "serde_json",
+ "specgraphen-model",
 ]
 
 [[package]]

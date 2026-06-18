@@ -150,6 +150,7 @@ impl JavaLifter {
         let mut all_incidences = Vec::new();
         let all_relations = Vec::new();
         let mut total_unresolved = 0;
+        let mut all_unresolved = Vec::new();
 
         for file_path in &files {
             let rel_path = file_path
@@ -177,6 +178,13 @@ impl JavaLifter {
                                 unresolved.target_text
                             ),
                             severity: DiagnosticSeverity::Warning,
+                        });
+                        all_unresolved.push(specgraphen_model::space_data::UnresolvedRecord {
+                            from_fqn: unresolved.from_fqn.clone(),
+                            target_text: unresolved.target_text.clone(),
+                            relation_type: unresolved.relation_type.clone(),
+                            file: unresolved.witness.file.clone(),
+                            line: unresolved.witness.start_line,
                         });
                     }
                     for inc in &extractor.incidences {
@@ -214,6 +222,7 @@ impl JavaLifter {
             fqn_to_cell_id_strings,
         );
 
+        space_data.unresolved = all_unresolved;
         space_data.rebuild_store();
         tracing::info!("HG InMemorySpaceStore built");
 

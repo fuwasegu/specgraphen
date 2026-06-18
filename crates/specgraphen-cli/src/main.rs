@@ -97,9 +97,29 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum QueryCommands {
-    Explain { symbol: String },
-    Callers { symbol: String },
-    Callees { symbol: String },
+    Explain {
+        symbol: String,
+    },
+    Callers {
+        symbol: String,
+    },
+    Callees {
+        symbol: String,
+    },
+    /// Bounded model-check: is `relation` reachable from `entry`?
+    Enforces {
+        entry: String,
+        relation: String,
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+    },
+    /// Measure information loss of the human spec projection.
+    SpecLoss,
+    /// Detect domain clusters (TDA) and package-boundary drift.
+    DomainClusters {
+        #[arg(long, default_value_t = 2)]
+        min_lifetime: usize,
+    },
 }
 
 #[tokio::main]
@@ -241,6 +261,22 @@ async fn main() -> anyhow::Result<()> {
                 }
                 QueryCommands::Callees { symbol } => {
                     let result = engine.callees(&symbol)?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                QueryCommands::Enforces {
+                    entry,
+                    relation,
+                    max_depth,
+                } => {
+                    let result = engine.enforces(&entry, &relation, max_depth)?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                QueryCommands::SpecLoss => {
+                    let result = engine.spec_loss_report()?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                QueryCommands::DomainClusters { min_lifetime } => {
+                    let result = engine.domain_clusters(min_lifetime)?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
             }

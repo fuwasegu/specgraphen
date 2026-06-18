@@ -13,7 +13,7 @@ pub fn spec_markdown(space_data: &SpaceData) -> Result<String> {
     let annotated_count = space_data
         .annotations
         .values()
-        .filter(|ann| has_content(ann))
+        .filter(|ann| ann.has_content())
         .count();
     writeln!(out, "# Specification: {}", space_data.space.name)?;
     writeln!(out)?;
@@ -98,17 +98,7 @@ fn annotation_for<'a>(space_data: &'a SpaceData, cell_id: &str) -> Option<&'a Se
     space_data
         .annotations
         .get(cell_id)
-        .filter(|ann| has_content(ann))
-}
-
-fn has_content(ann: &SemanticAnnotation) -> bool {
-    ann.intent.is_some()
-        || ann.behavior.is_some()
-        || ann.error_behavior.is_some()
-        || !ann.preconditions.is_empty()
-        || !ann.postconditions.is_empty()
-        || !ann.side_effects.is_empty()
-        || !ann.invariants.is_empty()
+        .filter(|ann| ann.has_content())
 }
 
 fn write_annotation(out: &mut String, ann: &SemanticAnnotation) -> Result<()> {
