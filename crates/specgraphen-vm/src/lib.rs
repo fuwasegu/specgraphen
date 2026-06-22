@@ -17,9 +17,11 @@
 //! The crate depends only on `tree-sitter` (the `Node` API), not on any
 //! grammar or on the rest of specgraphen, so it stays a small reusable core.
 
+pub mod enumerate;
 pub mod stepper;
 pub mod sym;
 
+pub use enumerate::{enumerate, Outcome, SpecTable, WorldLine};
 pub use stepper::{Frame, Stepper, Stop, StopKind};
 pub use sym::{
     bind_local, invalidate, is_logging_call, is_terminal_call, named_children, normalize,

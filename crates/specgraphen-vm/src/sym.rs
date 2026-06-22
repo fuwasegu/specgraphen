@@ -31,9 +31,19 @@ pub struct SymState {
 }
 
 /// Interns condition-atom labels to small indices, with a hard cap.
+///
+/// Each atom is the *bare* predicate text (a leading `!` is peeled off by the
+/// evaluator, so `X` and `!X` share one atom). To let a consumer display a
+/// column in the polarity the source actually wrote it — a legacy `if (!guard)`
+/// reads with no mental inversion — the table also records, per atom, whether
+/// it was ever seen in a positive vs negated context.
 #[derive(Debug, Clone)]
 pub struct AtomTable {
     names: Vec<String>,
+    /// Parallel to `names`: seen as a bare positive condition.
+    pos_seen: Vec<bool>,
+    /// Parallel to `names`: seen under an odd number of `!`.
+    neg_seen: Vec<bool>,
     max: usize,
 }
 
@@ -61,6 +71,8 @@ impl AtomTable {
     pub fn new(max: usize) -> Self {
         Self {
             names: Vec::new(),
+            pos_seen: Vec::new(),
+            neg_seen: Vec::new(),
             max,
         }
     }
@@ -74,7 +86,30 @@ impl AtomTable {
             return Err(SymError::TooManyAtoms { max: self.max });
         }
         self.names.push(label.to_string());
+        self.pos_seen.push(false);
+        self.neg_seen.push(false);
         Ok(self.names.len() - 1)
+    }
+
+    /// Record that atom `id` occurred in a positive (`negated == false`) or
+    /// negated context. Flags are monotonic — once true, they stay true.
+    pub fn mark_polarity(&mut self, id: usize, negated: bool) {
+        let flags = if negated {
+            &mut self.neg_seen
+        } else {
+            &mut self.pos_seen
+        };
+        if let Some(f) = flags.get_mut(id) {
+            *f = true;
+        }
+    }
+
+    /// `(seen_positive, seen_negated)` occurrence flags for an atom.
+    pub fn polarity(&self, id: usize) -> (bool, bool) {
+        (
+            self.pos_seen.get(id).copied().unwrap_or(false),
+            self.neg_seen.get(id).copied().unwrap_or(false),
+        )
     }
 
     pub fn name(&self, id: usize) -> &str {
@@ -113,13 +148,26 @@ impl Evaluator<'_> {
         node: tree_sitter::Node,
         state: SymState,
     ) -> Result<Vec<(SymState, bool)>, SymError> {
+        self.eval_neg(node, state, false)
+    }
+
+    /// As [`Self::eval`], plus `negated` = whether an odd number of `!` enclose
+    /// this node. It carries no logical weight (the value is still flipped
+    /// structurally); it only lets the leaf [`Self::atom`] record the polarity
+    /// the source wrote the predicate in, for display.
+    fn eval_neg(
+        &mut self,
+        node: tree_sitter::Node,
+        state: SymState,
+        negated: bool,
+    ) -> Result<Vec<(SymState, bool)>, SymError> {
         match node.kind() {
             "parenthesized_expression" => {
                 let inner = named_children(node);
                 let inner = inner
                     .first()
                     .ok_or(SymError::Malformed("empty parentheses"))?;
-                self.eval(*inner, state)
+                self.eval_neg(*inner, state, negated)
             }
             "unary_expression" => {
                 let op = node
@@ -130,12 +178,12 @@ impl Evaluator<'_> {
                     .ok_or(SymError::Malformed("unary without operand"))?;
                 if op.as_deref() == Some("!") {
                     Ok(self
-                        .eval(operand, state)?
+                        .eval_neg(operand, state, !negated)?
                         .into_iter()
                         .map(|(s, v)| (s, !v))
                         .collect())
                 } else {
-                    self.atom(node, state)
+                    self.atom(node, state, negated)
                 }
             }
             "binary_expression" => {
@@ -144,14 +192,14 @@ impl Evaluator<'_> {
                     .map(|n| text(n, self.src))
                     .unwrap_or_default();
                 match op.as_str() {
-                    "&&" => self.short_circuit(node, state, true),
-                    "||" => self.short_circuit(node, state, false),
-                    _ => self.atom(node, state),
+                    "&&" => self.short_circuit(node, state, true, negated),
+                    "||" => self.short_circuit(node, state, false, negated),
+                    _ => self.atom(node, state, negated),
                 }
             }
             "true" => Ok(vec![(state, true)]),
             "false" => Ok(vec![(state, false)]),
-            _ => self.atom(node, state),
+            _ => self.atom(node, state, negated),
         }
     }
 
@@ -162,6 +210,7 @@ impl Evaluator<'_> {
         node: tree_sitter::Node,
         state: SymState,
         and: bool,
+        negated: bool,
     ) -> Result<Vec<(SymState, bool)>, SymError> {
         let left = node
             .child_by_field_name("left")
@@ -171,9 +220,9 @@ impl Evaluator<'_> {
             .ok_or(SymError::Malformed("missing rhs"))?;
 
         let mut results = Vec::new();
-        for (s, v) in self.eval(left, state)? {
+        for (s, v) in self.eval_neg(left, state, negated)? {
             if v == and {
-                results.extend(self.eval(right, s)?);
+                results.extend(self.eval_neg(right, s, negated)?);
             } else {
                 results.push((s, v));
             }
@@ -187,9 +236,11 @@ impl Evaluator<'_> {
         &mut self,
         node: tree_sitter::Node,
         state: SymState,
+        negated: bool,
     ) -> Result<Vec<(SymState, bool)>, SymError> {
         let label = normalize(&text(node, self.src));
         let id = self.atoms.intern(&label)?;
+        self.atoms.mark_polarity(id, negated);
 
         if let Some(&(_, value)) = state.conds.iter().find(|(a, _)| *a == id) {
             return Ok(vec![(state, value)]);

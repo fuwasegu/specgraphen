@@ -106,6 +106,7 @@ struct Snapshot<'a> {
     incomplete: bool,
 }
 
+#[derive(Clone)]
 pub struct Stepper<'a> {
     src: &'a [u8],
     atoms: AtomTable,
@@ -157,8 +158,31 @@ impl<'a> Stepper<'a> {
         &self.state
     }
 
+    /// Seed an initial local binding before stepping begins — e.g. a callee
+    /// parameter bound to the caller's actual-argument value, for cross-method
+    /// step-into. At start there are no atoms yet, so this only records the
+    /// write; a later condition on the parameter can then settle from it (the
+    /// same `resolved_by_write` precision used for `x = "A"; if (x.equals("A"))`).
+    pub fn seed_local(&mut self, name: &str, value: &str) {
+        sym::bind_local(name, value, &self.atoms, &mut self.state);
+    }
+
     pub fn atoms(&self) -> &AtomTable {
         &self.atoms
+    }
+
+    /// The outcome string of a finished path (`return …`, `throw …`, a
+    /// terminal call), if this stepper has terminated. `None` while still
+    /// running or on fall-through.
+    pub fn finished_outcome(&self) -> Option<&str> {
+        self.finished.as_deref()
+    }
+
+    /// Drop the undo history. Used by the all-paths enumerator, which clones a
+    /// stepper at every branch and never undoes — keeping each clone's history
+    /// would make DFS memory grow with depth for no benefit.
+    pub fn forget_history(&mut self) {
+        self.history.clear();
     }
 
     /// Condition atoms decided so far, as readable `name = value` pairs — the
@@ -600,17 +624,42 @@ impl<'a> Stepper<'a> {
         };
 
         let cond_text = sym::normalize(&sym::text(cond, self.src));
-        self.pending = worlds
+        // A short-circuited `A && B` yields two *false* worlds (A=false; and
+        // A=true,B=false) that would otherwise share an identical `{false}`
+        // label. When a boolean value has more than one world, append the
+        // atoms each world newly pinned so they're distinguishable; simple
+        // single-world cases keep the clean `cond {value}` label.
+        let base_len = self.state.conds.len();
+        let true_count = worlds.iter().filter(|(_, v)| *v).count();
+        let false_count = worlds.len() - true_count;
+        let atoms = &self.atoms;
+        let pending: Vec<Pending> = worlds
             .into_iter()
             .map(|(state, value)| {
                 let branch = if value { then_branch } else { else_branch };
+                let ambiguous = if value { true_count } else { false_count } > 1;
+                let label = if ambiguous {
+                    let pins: Vec<String> = state
+                        .conds
+                        .get(base_len..)
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|&(id, v)| format!("{} == {}", atoms.name(id), v))
+                        .collect();
+                    // ⟨ … ∧ … ⟩ delimiters: a method-arg `, ` inside a pin
+                    // won't be confused for a pin separator by the UI parser.
+                    format!("{cond_text} {{{value}}}  ⟨{}⟩", pins.join(" ∧ "))
+                } else {
+                    format!("{cond_text} {{{value}}}")
+                };
                 Pending {
-                    label: format!("{cond_text} {{{value}}}"),
+                    label,
                     state,
                     body: branch.map(statements_of),
                 }
             })
             .collect();
+        self.pending = pending;
 
         // A bodyless else (the false world of an if without else) just
         // continues; collapse it so the user isn't asked a no-op question only
